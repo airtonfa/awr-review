@@ -1,0 +1,289 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AWR Review App</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <h1>AWR Review</h1>
+        <p id="fileStatus">No file loaded</p>
+        <p id="templateStatus">Active Template: not connected</p>
+      </div>
+      <div class="topbar-actions">
+        <label class="btn">
+          Load JSON
+          <input id="fileInput" type="file" accept="application/json,.json" hidden />
+        </label>
+        <label class="btn secondary">
+          Load Template
+          <input id="templateInput" type="file" accept=".potx,.pptx,application/vnd.openxmlformats-officedocument.presentationml.template,application/vnd.openxmlformats-officedocument.presentationml.presentation" hidden />
+        </label>
+        <button id="saveReportBtn" class="btn secondary" type="button" disabled>Save Report</button>
+        <label class="btn secondary">
+          Load Report
+          <input id="reportInput" type="file" accept="application/json,.json,.awrreport" hidden />
+        </label>
+        <button id="exportBtn" class="btn secondary" disabled>Export PPT</button>
+      </div>
+    </header>
+
+    <main class="layout">
+      <aside class="sidebar">
+        <section class="card">
+          <h2>Selection Mode</h2>
+          <label class="toggle-row">
+            <input id="linkSelections" type="checkbox" checked />
+            Link Web and PPT selections
+          </label>
+          <div class="tabs">
+            <button data-tab="web" class="tab active">Web</button>
+            <button data-tab="ppt" class="tab">PPT</button>
+          </div>
+        </section>
+
+        <section class="card">
+          <h2>Scope</h2>
+          <label>Cohorts</label>
+          <select id="cohortSelect" multiple size="7"></select>
+          <label>Databases</label>
+          <select id="dbSelect" multiple size="7"></select>
+          <label>Instances</label>
+          <select id="instanceSelect" multiple size="8"></select>
+        </section>
+
+        <section class="card">
+          <h2>Metrics</h2>
+          <div class="btn-row">
+            <button id="metricsAll" class="btn tiny">Select all</button>
+            <button id="metricsNone" class="btn tiny secondary">Clear all</button>
+          </div>
+          <div id="metricsList" class="metrics-list"></div>
+        </section>
+
+        <section class="card">
+          <div class="section-head">
+            <h2>PPT Storyboard</h2>
+            <div class="btn-row">
+              <button id="pptSlidesAll" class="btn tiny">All</button>
+              <button id="pptSlidesNone" class="btn tiny secondary">None</button>
+            </div>
+          </div>
+          <p id="pptSlidesStatus" class="muted">Load JSON to generate slides.</p>
+          <div id="pptSlidesList" class="ppt-slides-list"></div>
+        </section>
+      </aside>
+
+      <section class="content">
+        <section class="card" id="navCard">
+          <div class="nav-row">
+            <div id="pageNav" class="muted">Global</div>
+            <div class="layout-tools">
+              <button id="layoutEditBtn" class="btn tiny secondary" type="button">Customize: Off</button>
+              <button id="layoutSaveBtn" class="btn tiny secondary" type="button" disabled>Save View</button>
+              <button id="layoutResetBtn" class="btn tiny secondary" type="button">Reset View</button>
+            </div>
+          </div>
+          <p id="layoutStatus" class="muted"></p>
+        </section>
+
+        <section class="card" id="globalSummaryCard" data-layout-item="globalSummaryCard">
+          <h2>Global Summary</h2>
+          <div id="kpiGrid" class="kpi-grid"></div>
+        </section>
+
+        <section class="card" id="cohortChartsCard" data-layout-item="cohortChartsCard">
+          <h2>Cohort Charts</h2>
+          <p class="muted">All core cohort metrics shown together.</p>
+          <div id="cohortBarsGrid" class="triple-grid"></div>
+        </section>
+
+        <section class="card" id="databaseVersionsCard" data-layout-item="databaseVersionsCard">
+          <h2>Database Versions</h2>
+          <p class="muted">Distribution of databases grouped by version.</p>
+          <div class="chart-box">
+            <div id="dbVersionChart"></div>
+          </div>
+        </section>
+
+        <section class="card" id="cpuCard" data-layout-item="cpuCard">
+          <div class="section-head">
+            <h2>CPU Consumption</h2>
+            <button id="cpuScaleToggle" class="btn tiny secondary" type="button">Scale: Dynamic</button>
+          </div>
+          <p class="muted">Top (max), p95, and distribution by cohort from <code>database_statistics</code>.</p>
+          <div class="chart-box" style="margin-bottom:10px;">
+            <h3>CPU Profile Line Chart by Cohort</h3>
+            <div id="cpuLineGlobal"></div>
+          </div>
+          <div class="triple-grid">
+            <div class="chart-box mini-chart">
+              <h3>Top CPU by Cohort (max)</h3>
+              <div id="cpuTopChart"></div>
+            </div>
+            <div class="chart-box mini-chart">
+              <h3>CPU by Cohort p95</h3>
+              <div id="cpuP95Chart"></div>
+            </div>
+            <div class="chart-box mini-chart">
+              <h3>CPU Box Plot by Cohort</h3>
+              <div id="cpuBoxChart"></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="card" id="memoryCard" data-layout-item="memoryCard">
+          <h2>Memory Consumption</h2>
+          <p class="muted">Top (max), p95, and distribution by cohort from <code>database_statistics</code>.</p>
+          <div class="triple-grid">
+            <div class="chart-box mini-chart">
+              <h3>Top Memory by Cohort (max)</h3>
+              <div id="memTopChart"></div>
+            </div>
+            <div class="chart-box mini-chart">
+              <h3>Memory by Cohort p95</h3>
+              <div id="memP95Chart"></div>
+            </div>
+            <div class="chart-box mini-chart">
+              <h3>Memory Box Plot by Cohort</h3>
+              <div id="memBoxChart"></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="card" id="cohortOverviewCard" data-layout-item="cohortOverviewCard">
+          <h2>Cohort Overview</h2>
+          <p class="muted">Click a row to drill down into a cohort.</p>
+          <div class="table-wrap">
+            <table id="cohortTable">
+              <thead>
+                <tr>
+                  <th data-sort-key="cohort">Cohort</th>
+                  <th data-sort-key="dbs">Databases</th>
+                  <th data-sort-key="instances">Instances</th>
+                  <th data-sort-key="hosts">Hosts</th>
+                  <th data-sort-key="vcpu">vCPU</th>
+                  <th data-sort-key="mem">Memory (GB)</th>
+                  <th data-sort-key="allocated">Allocated (GB)</th>
+                  <th data-sort-key="used">Used (GB)</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="card" id="dbStatsCard" data-layout-item="dbStatsCard">
+          <h2>Database Statistics</h2>
+          <p class="muted">Summarized from <code>database_statistics</code> using selected metric families.</p>
+          <div class="table-wrap">
+            <table id="dbStatsTable">
+              <thead>
+                <tr>
+                  <th data-sort-key="metric">Metric</th>
+                  <th data-sort-key="p95">Avg p95</th>
+                  <th data-sort-key="p99">Avg p99</th>
+                  <th data-sort-key="max">Avg max</th>
+                  <th data-sort-key="topDb">Top DB by max</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="card" id="topSqlCard" data-layout-item="topSqlCard">
+          <h2>Top SQL</h2>
+          <p class="muted">From <code>top_sql</code>, filtered to selected databases.</p>
+          <div class="table-wrap">
+            <table id="topSqlTable">
+              <thead>
+                <tr>
+                  <th data-sort-key="db">DB</th>
+                  <th data-sort-key="sql_id">SQL ID</th>
+                  <th data-sort-key="elapsed">Elapsed</th>
+                  <th data-sort-key="execs">Execs</th>
+                  <th data-sort-key="log_reads">Logical Reads</th>
+                  <th data-sort-key="phy_read_gb">Physical Read GB</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="card" id="segmentIoCard" data-layout-item="segmentIoCard">
+          <h2>Segment IO</h2>
+          <p class="muted">From <code>segment_io</code>, filtered to selected databases.</p>
+          <div class="table-wrap">
+            <table id="segmentIoTable">
+              <thead>
+                <tr>
+                  <th data-sort-key="db">DB</th>
+                  <th data-sort-key="owner">Owner</th>
+                  <th data-sort-key="object_name">Object</th>
+                  <th data-sort-key="object_type">Type</th>
+                  <th data-sort-key="physical_io_tot">Total Physical IO</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="card" id="drillCard" data-layout-item="drillCard">
+          <h2 id="drillTitle">Drilldown</h2>
+          <p id="drillHint" class="muted">Select a cohort to view databases, then an instance to inspect details.</p>
+          <div id="drillPanel"></div>
+        </section>
+
+        <section class="card" id="cohortPage" style="display:none;">
+          <h2 id="cohortPageTitle">Cohort</h2>
+          <div id="cohortPageBody"></div>
+        </section>
+
+        <section class="card" id="instancePage" style="display:none;">
+          <h2 id="instancePageTitle">Instance</h2>
+          <div id="instancePageBody"></div>
+        </section>
+
+        <section class="card" id="pptPreviewPage" style="display:none;">
+          <div class="section-head">
+            <h2>PPT Preview</h2>
+            <div class="btn-row">
+              <button id="previewBackBtn" class="btn tiny secondary" type="button">Back</button>
+              <button id="previewPrevBtn" class="btn tiny secondary" type="button">Prev</button>
+              <button id="previewNextBtn" class="btn tiny secondary" type="button">Next</button>
+              <button id="previewExportBtn" class="btn tiny" type="button">Export PPT</button>
+            </div>
+          </div>
+          <p id="pptPreviewStatus" class="muted"></p>
+          <div class="ppt-preview-layout">
+            <div id="pptPreviewThumbs" class="ppt-preview-thumbs"></div>
+            <div id="pptPreviewBody" class="ppt-preview-stage"></div>
+          </div>
+        </section>
+      </section>
+    </main>
+
+    <div id="chartModal" class="chart-modal" aria-hidden="true">
+      <div class="chart-modal-backdrop" data-close-chart-modal="1"></div>
+      <div class="chart-modal-content" role="dialog" aria-modal="true" aria-label="Expanded chart">
+        <div class="chart-modal-header">
+          <h3 id="chartModalTitle">Chart</h3>
+          <button id="chartModalClose" class="btn tiny secondary" type="button">Close</button>
+        </div>
+        <div id="chartModalBody" class="chart-modal-body"></div>
+      </div>
+    </div>
+
+    <div id="chartTooltip" class="chart-tooltip" style="display:none;"></div>
+
+    <script src="./vendor/jszip.min.js"></script>
+    <script src="./vendor/pptxgen.min.js"></script>
+    <script src="./app.js"></script>
+  </body>
+</html>

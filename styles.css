@@ -1,0 +1,1003 @@
+:root {
+  --bg: #f6f7f9;
+  --panel: #ffffff;
+  --line: #d7dbe2;
+  --text: #1f2a37;
+  --muted: #596579;
+  --accent: #b11f1f;
+  --accent-soft: #f8e9e9;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: "Avenir Next", "Segoe UI", sans-serif;
+  color: var(--text);
+  background:
+    radial-gradient(circle at 10% 10%, rgba(177, 31, 31, 0.12), transparent 30%),
+    radial-gradient(circle at 90% 20%, rgba(15, 118, 110, 0.12), transparent 30%),
+    radial-gradient(circle at 30% 90%, rgba(29, 78, 216, 0.09), transparent 35%),
+    var(--bg);
+}
+
+.topbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.82);
+  backdrop-filter: blur(8px);
+  position: sticky;
+  top: 0;
+  z-index: 40;
+}
+
+.topbar h1 {
+  margin: 0;
+  font-size: 22px;
+}
+
+#fileStatus {
+  margin: 2px 0 0;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+#templateStatus {
+  margin: 2px 0 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.topbar-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.layout {
+  display: grid;
+  grid-template-columns: 320px minmax(0, 1fr);
+  gap: 14px;
+  padding: 14px;
+}
+
+.sidebar,
+.content {
+  display: grid;
+  gap: 12px;
+  align-content: start;
+}
+
+.content {
+  grid-template-columns: repeat(12, minmax(0, 1fr));
+}
+
+.content > .card {
+  grid-column: span 12;
+  align-self: start;
+}
+
+.content > .card[data-card-span="4"] {
+  grid-column: span 4;
+}
+
+.content > .card[data-card-span="8"] {
+  grid-column: span 8;
+}
+
+.content > .card[data-card-span="12"] {
+  grid-column: span 12;
+}
+
+.content > .card[data-card-height="s"] {
+  height: 320px;
+  overflow: auto;
+}
+
+.content > .card[data-card-height="m"] {
+  height: 500px;
+  overflow: auto;
+}
+
+.content > .card[data-card-height="l"] {
+  height: 760px;
+  overflow: auto;
+}
+
+.card {
+  position: relative;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  padding: 13px;
+  box-shadow: 0 8px 26px rgba(17, 24, 39, 0.05);
+  animation: cardIn 260ms ease both;
+}
+
+.card.card-height-custom {
+  overflow: auto;
+}
+
+@keyframes cardIn {
+  from {
+    opacity: 0;
+    transform: translateY(5px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.card h2 {
+  margin: 0 0 10px;
+  font-size: 17px;
+}
+
+.section-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: end;
+  gap: 8px;
+}
+
+.nav-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.layout-tools {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.layout-tools .btn {
+  white-space: nowrap;
+}
+
+#layoutStatus {
+  margin: 8px 0 0;
+}
+
+.card-size-controls {
+  display: none;
+  gap: 6px;
+  margin: 0 0 8px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+body.layout-editing .card-size-controls {
+  display: flex;
+}
+
+.chart-type-controls {
+  display: none;
+  gap: 6px;
+  margin: 0 0 8px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+body.layout-editing .chart-type-controls {
+  display: flex;
+}
+
+.chart-type-label {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.chart-type-btn.active {
+  background: #fff2f2;
+  border-color: var(--accent);
+  color: #7f1313;
+}
+
+.card-size-label {
+  font-size: 12px;
+  color: var(--muted);
+  margin-right: 0;
+  align-self: center;
+}
+
+.card-size-sep {
+  width: 1px;
+  height: 16px;
+  background: var(--line);
+  margin: 0 2px;
+}
+
+.card-size-btn.active {
+  background: #fff2f2;
+  border-color: var(--accent);
+  color: #7f1313;
+}
+
+.card-resize-handle {
+  display: none !important;
+  position: absolute;
+  width: 14px;
+  height: 14px;
+  right: 8px;
+  bottom: 8px;
+  border-radius: 4px;
+  border: 1px solid rgba(148, 163, 184, 0.7);
+  background:
+    linear-gradient(135deg, transparent 34%, rgba(148, 163, 184, 0.85) 35%, rgba(148, 163, 184, 0.85) 42%, transparent 43%),
+    linear-gradient(135deg, transparent 53%, rgba(148, 163, 184, 0.85) 54%, rgba(148, 163, 184, 0.85) 61%, transparent 62%),
+    rgba(255, 255, 255, 0.9);
+  cursor: nwse-resize;
+  opacity: 0.88;
+  z-index: 2;
+}
+
+.card-resize-handle:hover {
+  opacity: 1;
+}
+
+.section-head label {
+  margin: 0;
+}
+
+.btn {
+  cursor: pointer;
+  border: 1px solid var(--accent);
+  border-radius: 10px;
+  background: var(--accent);
+  color: #fff;
+  padding: 7px 10px;
+  font-weight: 600;
+  transition: transform 140ms ease, box-shadow 140ms ease;
+}
+
+.btn:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 8px 16px rgba(177, 31, 31, 0.24);
+}
+
+.btn.secondary {
+  background: #fff;
+  color: var(--accent);
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn.tiny {
+  font-size: 12px;
+  padding: 4px 8px;
+}
+
+.btn-row {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.toggle-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+}
+
+.tabs {
+  margin-top: 10px;
+  display: flex;
+  gap: 8px;
+}
+
+.tab {
+  flex: 1;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fff;
+  cursor: pointer;
+}
+
+.tab.active {
+  border-color: var(--accent);
+  background: linear-gradient(180deg, #fff2f2, #ffe8e8);
+  color: #7f1313;
+  font-weight: 700;
+}
+
+label {
+  display: block;
+  font-size: 12px;
+  color: var(--muted);
+  margin: 7px 0 3px;
+}
+
+select {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 5px;
+  font-family: inherit;
+  background: #fff;
+}
+
+.metrics-list {
+  max-height: 320px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px;
+}
+
+.ppt-slides-list {
+  max-height: 360px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px;
+  background: #fff;
+}
+
+.slide-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border-bottom: 1px solid #eef2f7;
+  padding: 6px 4px;
+  font-size: 12px;
+}
+
+.slide-row:last-child {
+  border-bottom: 0;
+}
+
+.slide-badge {
+  display: inline-block;
+  min-width: 72px;
+  text-align: center;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  border-radius: 999px;
+  border: 1px solid #dbe2ea;
+  background: #f8fafc;
+  color: #334155;
+  padding: 2px 6px;
+}
+
+.slide-title {
+  color: #1f2a37;
+}
+
+.ppt-preview-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 10px;
+}
+
+.ppt-preview-card {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px;
+  background: linear-gradient(180deg, #fff, #f8fafc);
+}
+
+.ppt-preview-card h4 {
+  margin: 0 0 4px;
+  font-size: 13px;
+  color: #0f172a;
+}
+
+.ppt-preview-card p {
+  margin: 0;
+  font-size: 11px;
+  color: #64748b;
+}
+
+.ppt-preview-layout {
+  display: grid;
+  grid-template-columns: 320px minmax(0, 1fr);
+  gap: 12px;
+}
+
+.ppt-preview-thumbs {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fff;
+  max-height: 72vh;
+  overflow: auto;
+  padding: 8px;
+}
+
+.ppt-thumb {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: linear-gradient(180deg, #fff, #f8fafc);
+  margin-bottom: 8px;
+  padding: 6px;
+  cursor: pointer;
+}
+
+.ppt-thumb.active {
+  border-color: rgba(177, 31, 31, 0.45);
+  box-shadow: 0 8px 18px rgba(15, 23, 42, 0.1);
+}
+
+.ppt-thumb-title {
+  margin-top: 6px;
+  font-size: 11px;
+  color: #334155;
+}
+
+.ppt-preview-stage {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fff;
+  padding: 12px;
+  min-height: 500px;
+}
+
+.ppt-stage-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  font-size: 12px;
+  color: #475569;
+}
+
+.ppt-slide-mock {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  border: 1px solid #dbe2ea;
+  border-radius: 8px;
+  background: #fff;
+  overflow: hidden;
+  position: relative;
+}
+
+.ppt-slide-mock .top-band {
+  height: 10px;
+  background: #b11f1f;
+}
+
+.ppt-slide-mock .left-band {
+  position: absolute;
+  left: 10px;
+  top: 20px;
+  width: 6px;
+  height: 64px;
+  background: #7f1313;
+  border-radius: 2px;
+}
+
+.ppt-slide-mock .content {
+  padding: 18px 18px 14px 28px;
+  position: relative;
+  height: calc(100% - 10px);
+}
+
+.ppt-slide-mock .title {
+  font-size: 24px;
+  font-weight: 700;
+  color: #7f1313;
+  line-height: 1.15;
+}
+
+.ppt-slide-mock .subtitle {
+  margin-top: 6px;
+  font-size: 12px;
+  color: #64748b;
+}
+
+.ppt-slide-mock .chips {
+  margin-top: 12px;
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.ppt-slide-mock .mock-kpis {
+  margin-top: 10px;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.ppt-slide-mock .mock-kpi {
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  background: #f8fafc;
+  padding: 4px 6px;
+}
+
+.ppt-slide-mock .mock-kpi span {
+  display: block;
+  font-size: 10px;
+  color: #64748b;
+}
+
+.ppt-slide-mock .mock-kpi strong {
+  display: block;
+  margin-top: 1px;
+  font-size: 11px;
+  color: #1f2937;
+}
+
+.ppt-slide-mock .mock-table {
+  margin-top: 10px;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  overflow: hidden;
+  background: #fff;
+}
+
+.ppt-slide-mock .mock-row {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: 1fr;
+  gap: 6px;
+  padding: 5px 8px;
+  border-bottom: 1px solid #f1f5f9;
+  font-size: 10px;
+  color: #334155;
+}
+
+.ppt-slide-mock .mock-row.head {
+  background: #f8fafc;
+  font-weight: 700;
+  color: #0f172a;
+}
+
+.ppt-slide-mock .mock-row:last-child {
+  border-bottom: 0;
+}
+
+.ppt-slide-mock .mock-layout-zone {
+  position: absolute;
+  border: 1px dashed #cbd5e1;
+  border-radius: 6px;
+  color: #64748b;
+  font-size: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(248, 250, 252, 0.55);
+  pointer-events: none;
+}
+
+.ppt-slide-mock .mock-layout-zone.chart {
+  border-color: #b6c4d9;
+}
+
+.ppt-slide-mock .mock-layout-zone.table {
+  border-color: #d2dbe8;
+}
+
+.ppt-slide-mock .mock-layout-zone.image {
+  padding: 0;
+  overflow: hidden;
+  background: #fff;
+}
+
+.ppt-slide-mock .mock-layout-zone.image img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.ppt-slide-mock .mock-layout-zone.image span {
+  font-size: 10px;
+  color: #64748b;
+}
+
+.ppt-slide-mock.separator .content,
+.ppt-slide-mock.cover .content {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  min-height: calc(100% - 24px);
+}
+
+.ppt-slide-mock.separator .title,
+.ppt-slide-mock.cover .title {
+  font-size: 34px;
+  text-align: center;
+}
+
+.ppt-slide-mock.separator .subtitle,
+.ppt-slide-mock.cover .subtitle {
+  text-align: center;
+}
+
+.ppt-slide-mock .chip {
+  border: 1px solid #dbe2ea;
+  background: #f8fafc;
+  border-radius: 999px;
+  padding: 4px 8px;
+  font-size: 11px;
+  color: #334155;
+}
+
+.ppt-slide-mock .note {
+  margin-top: 12px;
+  font-size: 12px;
+  color: #475569;
+}
+
+.ppt-slide-mock.compact .title {
+  font-size: 10px;
+}
+
+.ppt-slide-mock.compact .subtitle,
+.ppt-slide-mock.compact .mock-kpis,
+.ppt-slide-mock.compact .mock-table,
+.ppt-slide-mock.compact .chips,
+.ppt-slide-mock.compact .note {
+  display: none;
+}
+
+.ppt-slide-mock.compact .top-band {
+  height: 6px;
+}
+
+.ppt-slide-mock.compact .left-band {
+  left: 6px;
+  top: 12px;
+  width: 4px;
+  height: 32px;
+}
+
+.ppt-slide-mock.compact .content {
+  padding: 12px 10px 8px 16px;
+}
+
+.metric-group {
+  margin-bottom: 10px;
+}
+
+.metric-group h3 {
+  margin: 4px 0;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #7f1313;
+}
+
+.metric-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 0;
+  font-size: 13px;
+}
+
+.kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 10px;
+}
+
+.kpi {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  padding: 10px;
+  background:
+    linear-gradient(145deg, rgba(255, 255, 255, 0.95), rgba(250, 251, 255, 0.8));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.8);
+  transition: transform 180ms ease, box-shadow 180ms ease;
+}
+
+.kpi:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 12px 24px rgba(15, 23, 42, 0.1);
+}
+
+.kpi .name {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.kpi .value {
+  font-size: 24px;
+  font-weight: 700;
+  margin-top: 3px;
+}
+
+.chart-box {
+  --chart-height: 280px;
+  position: relative;
+  min-height: 180px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  padding: 8px;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.95), rgba(248, 250, 253, 0.92));
+  box-shadow: 0 10px 22px rgba(15, 23, 42, 0.08);
+  transition: transform 180ms ease, box-shadow 180ms ease, border-color 180ms ease;
+}
+
+.chart-box svg {
+  width: 100%;
+  height: var(--chart-height);
+  display: block;
+  filter: drop-shadow(0 2px 8px rgba(15, 23, 42, 0.06));
+}
+
+.triple-grid {
+  display: grid;
+  grid-template-columns: repeat(12, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.triple-grid > * {
+  grid-column: span 4;
+}
+
+.mini-chart h3 {
+  margin: 0 0 6px;
+  font-size: 13px;
+  color: #334155;
+}
+
+.mini-chart svg {
+  height: var(--chart-height, 260px);
+}
+
+.line-legend {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.line-legend span {
+  background: rgba(255, 255, 255, 0.75);
+  border: 1px solid rgba(148, 163, 184, 0.3);
+  border-radius: 999px;
+  padding: 3px 8px;
+  font-weight: 500;
+}
+
+.line-legend span::before {
+  content: "";
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  margin-right: 5px;
+  border-radius: 2px;
+  background: var(--legend-color);
+  vertical-align: -1px;
+}
+
+.chart-box {
+  cursor: zoom-in;
+}
+
+.chart-box:hover {
+  transform: translateY(-2px);
+  border-color: rgba(177, 31, 31, 0.35);
+  box-shadow: 0 18px 36px rgba(15, 23, 42, 0.15);
+}
+
+.chart-resize-handle {
+  position: absolute;
+  width: 14px;
+  height: 14px;
+  right: 6px;
+  bottom: 6px;
+  border-radius: 4px;
+  border: 1px solid rgba(148, 163, 184, 0.7);
+  background:
+    linear-gradient(135deg, transparent 34%, rgba(148, 163, 184, 0.85) 35%, rgba(148, 163, 184, 0.85) 42%, transparent 43%),
+    linear-gradient(135deg, transparent 53%, rgba(148, 163, 184, 0.85) 54%, rgba(148, 163, 184, 0.85) 61%, transparent 62%),
+    rgba(255, 255, 255, 0.9);
+  cursor: nwse-resize;
+  opacity: 0.88;
+}
+
+.chart-resize-handle:hover {
+  opacity: 1;
+}
+
+body.resizing-charts,
+body.resizing-charts * {
+  user-select: none !important;
+  cursor: nwse-resize !important;
+}
+
+body.resizing-cards,
+body.resizing-cards * {
+  user-select: none !important;
+  cursor: nwse-resize !important;
+}
+
+.chart-modal {
+  position: fixed;
+  inset: 0;
+  display: none;
+  z-index: 9999;
+}
+
+.chart-modal.open {
+  display: block;
+}
+
+.chart-modal-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.55);
+  backdrop-filter: blur(2px);
+}
+
+.chart-modal-content {
+  position: relative;
+  z-index: 1;
+  width: min(1200px, 92vw);
+  max-height: 88vh;
+  overflow: auto;
+  margin: 4vh auto;
+  border-radius: 14px;
+  border: 1px solid rgba(148, 163, 184, 0.3);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(248, 250, 253, 0.98));
+  box-shadow: 0 24px 80px rgba(2, 6, 23, 0.35);
+  padding: 12px;
+}
+
+.chart-modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.chart-modal-header h3 {
+  margin: 0;
+  font-size: 18px;
+}
+
+.chart-modal-body svg {
+  width: 100%;
+  height: min(72vh, 640px);
+}
+
+.chart-tooltip {
+  position: fixed;
+  z-index: 10000;
+  pointer-events: none;
+  max-width: 320px;
+  background: rgba(15, 23, 42, 0.92);
+  color: #f8fafc;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  border-radius: 8px;
+  padding: 6px 8px;
+  font-size: 12px;
+  line-height: 1.3;
+  box-shadow: 0 8px 24px rgba(2, 6, 23, 0.35);
+}
+
+.muted {
+  color: var(--muted);
+  font-size: 13px;
+  margin-top: 0;
+}
+
+.page-link {
+  color: #7f1313;
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.table-wrap {
+  overflow: auto;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+th,
+td {
+  border-bottom: 1px solid var(--line);
+  padding: 8px;
+  text-align: left;
+  white-space: nowrap;
+}
+
+th {
+  background: #f8fafc;
+}
+
+th[data-sort-key] {
+  cursor: pointer;
+  user-select: none;
+}
+
+th[data-sort-key].sort-active {
+  color: #7f1313;
+}
+
+svg path,
+svg rect {
+  transition: all 0.3s ease;
+}
+
+tr.clickable:hover {
+  background: #faf2f2;
+  cursor: pointer;
+}
+
+.card.layout-draggable {
+  cursor: grab;
+}
+
+.card.layout-draggable h2 {
+  user-select: none;
+}
+
+.card.layout-dragging {
+  opacity: 0.55;
+  transform: scale(0.995);
+}
+
+.card.layout-drop-target {
+  outline: 2px dashed rgba(177, 31, 31, 0.45);
+  outline-offset: 4px;
+}
+
+@media (max-width: 980px) {
+  .layout {
+    grid-template-columns: 1fr;
+  }
+
+  .content {
+    grid-template-columns: 1fr;
+  }
+
+  .content > .card,
+  .content > .card[data-card-span="4"],
+  .content > .card[data-card-span="8"],
+  .content > .card[data-card-span="12"] {
+    grid-column: auto;
+  }
+
+  .content > .card[data-card-height="s"],
+  .content > .card[data-card-height="m"],
+  .content > .card[data-card-height="l"] {
+    height: auto;
+    overflow: visible;
+  }
+
+  .triple-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .triple-grid > * {
+    grid-column: auto;
+  }
+
+  .ppt-preview-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .ppt-preview-thumbs {
+    max-height: 260px;
+  }
+}

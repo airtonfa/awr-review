@@ -1,53 +1,94 @@
-# AWR Review App (Sprint 1 + Step 1)
+# AWR Review App
 
-## Implemented
-- JSON upload and validation (`instances` required)
-- Canonical model (`cohort -> database -> instance`)
-- Two selection contexts (`Web` and `PPT`) with link/unlink toggle
-- Scope filters (cohorts, databases, instances)
-- Metric catalog with grouped checkboxes
-  - Core summary metrics
-  - Dynamic `database_statistics` metrics
-  - Optional advanced panels (`top_sql`, `segment_io`)
-- Global KPI summary cards
-- Cohort overview table with drilldown
-- Cohort bar chart (metric selector)
-- Database statistics summary table (p95/p99/max)
-- Top SQL table (filtered by selected DBs)
-- Segment IO table (filtered by selected DBs)
-- Drilldown to database and instance detail tables
+Web application + PowerPoint generator for reviewing Oracle AWR/OCCA JSON outputs and producing executive-ready reports.
 
-## Open
-The app can be opened directly from:
-`/Users/airtonalmeida/Documents/codex/AWR Review/index.html`
+## What This Application Does
 
-For template-native PPT export from the app button, run the integrated server:
+- Loads AWR/OCCA JSON files and builds an interactive analysis workspace.
+- Organizes data by:
+  - `Cohort`
+  - `Database`
+  - `Instance`
+- Shows global and drill-down analytics (cohort and instance levels).
+- Lets users select/deselect:
+  - Cohorts, databases, instances
+  - Metrics to display
+  - PPT slides to export
+- Exports a PowerPoint report using an Oracle template (`.potx`) with:
+  - Title/divider/content/closing structure
+  - Summary, cohort, and instance sections
+  - Native PPT charts + Python-rendered boxplots where needed
+
+## Main Features
+
+- Global dashboard with KPIs (DBs, hosts, instances, vCPU, memory, storage).
+- CPU and memory visualizations with drill-down navigation.
+- Cohort and instance detail pages.
+- Sortable tables for major datasets.
+- Save/Load report state (selection + layout choices).
+- Template-native PPT export via local API server.
+
+## Project Files
+
+- `/Users/airtonalmeida/Documents/codex/AWR Review/index.html` - UI shell
+- `/Users/airtonalmeida/Documents/codex/AWR Review/app.js` - frontend logic, charts, interactions
+- `/Users/airtonalmeida/Documents/codex/AWR Review/styles.css` - styling
+- `/Users/airtonalmeida/Documents/codex/AWR Review/app_server.py` - local server + export API
+- `/Users/airtonalmeida/Documents/codex/AWR Review/template_export.py` - template-based PPT generator
+
+## Architecture
+
+```mermaid
+flowchart LR
+  U["User (Browser)"] --> FE["Frontend UI (index.html + app.js + styles.css)"]
+  FE -->|Load JSON| J["AWR/OCCA JSON Data Model"]
+  FE -->|Export PPT (HTTP)| API["Local API Server (app_server.py)"]
+  API -->|Build slides| EXP["Template Export Engine (template_export.py)"]
+  EXP -->|Read template| T["Oracle .potx Template"]
+  EXP -->|Generate| P[".pptx Report"]
+```
+
+### Runtime Flow
+
+1. Frontend loads JSON and builds normalized structures for cohorts, databases, instances, and metrics.
+2. User configures filters and slide selection in the UI.
+3. On `Export PPT`, frontend sends report state to `app_server.py`.
+4. Server calls `template_export.py` to merge selected data into Oracle template layouts.
+5. Generated `.pptx` is streamed back to browser for download.
+
+## How To Run
+
+From project root:
 
 ```bash
-/Users/airtonalmeida/Documents/codex/AWR\ Review/.venv/bin/python \
-  /Users/airtonalmeida/Documents/codex/AWR\ Review/app_server.py \
+cd "/Users/airtonalmeida/Documents/codex/AWR Review"
+```
+
+Start the app server (required for template-native PPT export):
+
+```bash
+./.venv/bin/python app_server.py \
   --host 127.0.0.1 --port 8080 \
-  --root /Users/airtonalmeida/Documents/codex/AWR\ Review \
-  --template /Users/airtonalmeida/Downloads/Oracle_PPT-template_FY26.potx
+  --root "/Users/airtonalmeida/Documents/codex/AWR Review" \
+  --template "/Users/airtonalmeida/Library/Group Containers/UBF8T346G9.Office/User Content.localized/Templates.localized/AWR Template.potx"
 ```
 
-Then open:
-`http://localhost:8080`
+Open in browser:
 
-Note: the UI is configured to require template-native export. If `/api/export-template` is unavailable, export is blocked instead of falling back to the browser-based exporter.
+- `http://127.0.0.1:8080`
 
-## Input sample
-`/Users/airtonalmeida/Documents/AWR/Alelo/awr_miner_occa/awr_occa_upload_data.json`
+## Typical Workflow
 
-## Template-Native PPT Export (Oracle `.potx`)
-To generate a deck that uses Oracle template layouts (white/light slides) and native editable PowerPoint charts:
+1. Load JSON (`Load JSON`)
+2. Optionally load/update template (`Load Template`)
+3. Review global/cohort/instance analytics
+4. Adjust scope + metric selections
+5. Choose PPT slides in `PPT Storyboard`
+6. Click `Export PPT`
 
-```bash
-/Users/airtonalmeida/Documents/codex/AWR\ Review/.venv/bin/python \
-  /Users/airtonalmeida/Documents/codex/AWR\ Review/template_export.py \
-  --input /Users/airtonalmeida/Documents/AWR/Alelo/awr_miner_occa/awr_occa_upload_data.json \
-  --template /Users/airtonalmeida/Downloads/Oracle_PPT-template_FY26.potx \
-  --output /tmp/AWR_template_native_test.pptx
-```
+## Notes
 
-You can also pass a previously saved report JSON (the app `Save` output) to preserve PPT scope selections.
+- Export is configured to prefer template-native generation.
+- If export server/template is unavailable, the app will show a clear error.
+- Recommended input example:
+  - `/Users/airtonalmeida/Documents/AWR/Alelo/awr_miner_occa/awr_occa_upload_data.json`

@@ -18,8 +18,15 @@ venv/
 *.tmp
 *.temp
 /tmp/
+build/
+dist/
+*.spec
 
 # Local outputs
 *.pptx
 *.potx
 .awrreport
+
+# Local keys
+git-key
+git-key.pub

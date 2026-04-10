@@ -86,6 +86,31 @@ Open in browser:
 5. Choose PPT slides in `PPT Storyboard`
 6. Click `Export PPT`
 
+## Build macOS Installer (.pkg)
+
+This project can be packaged as a standalone macOS app and installer package.
+
+### What gets bundled
+
+- Python runtime (via PyInstaller)
+- App server + PPT export engine
+- Frontend files (`index.html`, `app.js`, `styles.css`, `vendor/*`)
+- Python dependencies from `requirements.txt`
+
+### Build command
+
+```bash
+cd "/Users/airtonalmeida/Documents/codex/AWR Review"
+./scripts/build_macos_pkg.sh
+```
+
+### Output
+
+- App bundle: `dist/AWR Review.app`
+- Installer: `dist/AWR-Review-macOS.pkg`
+
+Install by opening the `.pkg` file; it installs the app into `/Applications`.
+
 ## Notes
 
 - Export is configured to prefer template-native generation.

@@ -1865,7 +1865,9 @@ function toBase64(bytes) {
 }
 
 async function probeTemplateApi() {
-  if (state.templateApiAvailable != null) {
+  // Keep quick path only when already confirmed reachable.
+  // If it was unreachable before, retry because server/template state can change.
+  if (state.templateApiAvailable === true) {
     updateTemplateStatusText();
     return state.templateApiAvailable;
   }
@@ -1878,7 +1880,7 @@ async function probeTemplateApi() {
       return false;
     }
     const data = await res.json().catch(() => ({}));
-    state.templateApiAvailable = Boolean(data?.ok && data?.template_exists);
+    state.templateApiAvailable = Boolean(data?.ok);
     state.templatePath = data?.template_path || '';
     updateTemplateStatusText();
     return state.templateApiAvailable;

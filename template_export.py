@@ -55,6 +55,8 @@ PALETTE = [
     ORACLE_COLORS["accent6"],
     ORACLE_COLORS["accent4"],
 ]
+# Conversion used for Exadata-family ECPU sizing (Exascale and Exadata Dedicated).
+ECPU_PER_VCPU_EXADATA = 2.0
 
 
 def short_label(s: Any, n: int = 34) -> str:
@@ -203,6 +205,510 @@ def stats_from_values(vals: list[float]) -> dict[str, float] | None:
         "p95": quantile(clean, 0.95),
         "max": clean[-1],
     }
+
+
+def pct(numer: float, denom: float) -> float:
+    if denom <= 0:
+        return 0.0
+    return 100.0 * numer / denom
+
+
+def parse_ai_response_lines(ui_state: dict[str, Any] | None, max_lines: int = 3) -> list[str]:
+    if not isinstance(ui_state, dict):
+        return []
+    ai = ui_state.get("aiChat")
+    if not isinstance(ai, dict):
+        return []
+    text = str(ai.get("response") or "").strip()
+    if not text:
+        return []
+    lines: list[str] = []
+    for raw in text.splitlines():
+        t = raw.strip()
+        if not t:
+            continue
+        t = re.sub(r"^\s*[-*•]+\s*", "", t)
+        t = re.sub(r"^\s*\d+\.\s*", "", t)
+        if t:
+            lines.append(t)
+        if len(lines) >= max_lines:
+            break
+    return lines
+
+
+def get_ai_app_payload(ui_state: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(ui_state, dict):
+        return None
+    ai = ui_state.get("aiChat")
+    if not isinstance(ai, dict):
+        return None
+    payload = ai.get("appPayload")
+    return payload if isinstance(payload, dict) else None
+
+
+def pick_payload_comments(payload: dict[str, Any] | None, scope: str, key: str | None = None, max_lines: int = 4) -> list[str]:
+    if not isinstance(payload, dict):
+        return []
+    if scope == "global":
+        arr = payload.get("global_comments")
+        if isinstance(arr, list):
+            return [str(x).strip() for x in arr if str(x).strip()][:max_lines]
+        return []
+    if scope == "cohort" and key:
+        mp = payload.get("cohort_comments")
+        if isinstance(mp, dict) and isinstance(mp.get(key), list):
+            return [str(x).strip() for x in mp.get(key) if str(x).strip()][:max_lines]
+        return []
+    if scope == "instance" and key:
+        mp = payload.get("instance_comments")
+        if isinstance(mp, dict) and isinstance(mp.get(key), list):
+            return [str(x).strip() for x in mp.get(key) if str(x).strip()][:max_lines]
+        return []
+    return []
+
+
+def payload_infra_line(payload: dict[str, Any] | None) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    infra = payload.get("infrastructure_recommendation")
+    if not isinstance(infra, dict):
+        return ""
+    tier = str(infra.get("recommended_tier") or "").strip()
+    pos = infra.get("scale_position")
+    if not tier:
+        return ""
+    rationale = infra.get("rationale")
+    rat0 = ""
+    if isinstance(rationale, list) and rationale:
+        rat0 = str(rationale[0] or "").strip()
+    if rat0:
+        return f"Infrastructure recommendation: {tier} (scale {pos}). {rat0}"
+    return f"Infrastructure recommendation: {tier} (scale {pos})."
+
+
+def infra_assessment(
+    model: "Model",
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    del payload  # deterministic sizing logic only
+
+    # Sizing limits used by this deterministic model.
+    # These thresholds are also surfaced as footnotes in the executive slide.
+    base_limits = {"ecpu": 256.0, "memory_gb": 512.0, "storage_tb": 80.0, "iops": 8000.0}
+    xs_limits = {"ecpu": 200.0, "storage_tb": 100.0}
+    # Exadata memory policy:
+    # use one DB server memory instead of aggregated two-server memory
+    # and cap cohort usage at 70% of that one-server memory.
+    exa_one_db_server_memory_gb = 1390.0
+    exa_cohort_memory_limit_gb = exa_one_db_server_memory_gb * 0.70
+    exa_env_limits = {"ecpu": 1520.0, "memory_gb": exa_cohort_memory_limit_gb, "storage_tb": 5000.0, "iops": 89_000_000.0}
+    exa_server_capacity = {"db_ecpu": 380.0, "db_memory_gb": exa_cohort_memory_limit_gb, "storage_tb": 300.0, "storage_iops": 15_000_000.0}
+
+    def fmt_req_limit(req: float, lim: float, unit: str, d: int = 1) -> str:
+        return f"{fmt_num(req, d)}/{fmt_num(lim, d)} {unit}"
+
+    selected = model.selected_rows()
+    cohorts = model.cohorts()
+    total_instances = len(selected)
+    total_cohorts = len(cohorts)
+
+    # Base Database fit (instance-by-instance).
+    base_db_servers = 0
+    base_failures: list[str] = []
+    for r in selected:
+        cpu = float(r.init_cpu_count or r.logical_cpu_count or 0.0)
+        mem_gb = float(r.mem_gb or (r.sga_gb + r.pga_gb) or 0.0)
+        st = model.db_metric_stats(r.cohort, r.db, "Allocated Storage (GB)") or {}
+        storage_tb = float(st.get("p95") or st.get("max") or 0.0) / 1024.0
+        it = model.db_metric_stats(r.cohort, r.db, "DB IOPS") or {}
+        iops = float(it.get("p95") or it.get("max") or 0.0)
+        db_name = model.display_db_name(r.db)
+        inst_label = model.instance_label(r.instance)
+
+        if cpu > base_limits["ecpu"]:
+            base_failures.append(f"{db_name} ({inst_label}) CPU {fmt_req_limit(cpu, base_limits['ecpu'], 'ECPU')}")
+        if mem_gb > base_limits["memory_gb"]:
+            base_failures.append(f"{db_name} ({inst_label}) Memory {fmt_req_limit(mem_gb, base_limits['memory_gb'], 'GB')}")
+        if storage_tb > base_limits["storage_tb"]:
+            base_failures.append(f"{db_name} ({inst_label}) Storage {fmt_req_limit(storage_tb, base_limits['storage_tb'], 'TB')}")
+        if iops > base_limits["iops"]:
+            base_failures.append(f"{db_name} ({inst_label}) IOPS {fmt_req_limit(iops, base_limits['iops'], 'IOPS', 0)}")
+
+        base_db_servers += 2 if model.db_is_rac(r.db) else 1
+
+    base_fit = len(base_failures) == 0
+    base_reason = "Fit for all instances." if base_fit else f"Not Fit: {base_failures[0]}"
+
+    # Exascale fit (one deployment per cohort).
+    xs_failures: list[str] = []
+    xs_cohort_details: list[dict[str, Any]] = []
+    cohort_matrix: list[dict[str, Any]] = []
+    for c in cohorts:
+        rs = model.rows_for_cohort(c)
+        sm = model.summary(rs)
+        c_vcpu = float(sm.get("vcpu_total") or 0.0)
+        c_cpu = c_vcpu * ECPU_PER_VCPU_EXADATA
+        c_mem_gb = float(sm.get("memory_gb_total") or 0.0)
+        c_storage_tb = float(sm.get("allocated_storage_gb") or 0.0) / 1024.0
+        c_iops = max((float(v) for _, v in model.metric_by_db(c, "DB IOPS", scale=1.0)), default=0.0)
+
+        largest = sorted(
+            rs,
+            key=lambda r: ((r.init_cpu_count or r.logical_cpu_count), r.mem_gb, r.sga_gb + r.pga_gb),
+            reverse=True,
+        )[0] if rs else None
+        li_cpu = float((largest.init_cpu_count or largest.logical_cpu_count) if largest else 0.0)
+        li_mem_stats = model.db_metric_stats(c, largest.db, "DB Memory (MB)") if largest else None
+        li_iops_stats = model.db_metric_stats(c, largest.db, "DB IOPS") if largest else None
+        li_storage_stats = model.db_metric_stats(c, largest.db, "Allocated Storage (GB)") if largest else None
+        li_mem_gb = float((li_mem_stats or {}).get("p95") or 0.0) / 1024.0
+        if li_mem_gb <= 0 and largest:
+            li_mem_gb = float((largest.sga_gb or 0.0) + (largest.pga_gb or 0.0))
+        li_iops = float((li_iops_stats or {}).get("p95") or (li_iops_stats or {}).get("max") or 0.0)
+        li_storage_tb = float((li_storage_stats or {}).get("p95") or (li_storage_stats or {}).get("max") or 0.0) / 1024.0
+
+        base_blockers = []
+        if li_cpu > base_limits["ecpu"]:
+            base_blockers.append(f"CPU {fmt_req_limit(li_cpu, base_limits['ecpu'], 'ECPU')}")
+        if li_storage_tb > base_limits["storage_tb"]:
+            base_blockers.append(f"Storage {fmt_req_limit(li_storage_tb, base_limits['storage_tb'], 'TB')}")
+        if li_mem_gb > base_limits["memory_gb"]:
+            base_blockers.append(f"Memory {fmt_req_limit(li_mem_gb, base_limits['memory_gb'], 'GB')}")
+        if li_iops > base_limits["iops"]:
+            base_blockers.append(f"IOPS {fmt_req_limit(li_iops, base_limits['iops'], 'IOPS', 0)}")
+        base_fit_c = len(base_blockers) == 0
+
+        blockers: list[str] = []
+        if c_cpu > xs_limits["ecpu"]:
+            blockers.append(f"CPU {fmt_req_limit(c_cpu, xs_limits['ecpu'], 'ECPU')}")
+        if c_storage_tb > xs_limits["storage_tb"]:
+            blockers.append(f"Storage {fmt_req_limit(c_storage_tb, xs_limits['storage_tb'], 'TB')}")
+        xs_cohort_details.append(
+            {
+                "cohort": c,
+                "fit": len(blockers) == 0,
+                "reason": "Fit" if len(blockers) == 0 else f"Not Fit: {blockers[0]}",
+            }
+        )
+        if blockers:
+            xs_failures.append(f"{c}: {blockers[0]}")
+
+        d_blockers = []
+        if c_cpu > exa_env_limits["ecpu"]:
+            d_blockers.append(f"CPU {fmt_req_limit(c_cpu, exa_env_limits['ecpu'], 'ECPU')}")
+        if c_storage_tb > exa_env_limits["storage_tb"]:
+            d_blockers.append(f"Storage {fmt_req_limit(c_storage_tb, exa_env_limits['storage_tb'], 'TB')}")
+        if c_mem_gb > exa_env_limits["memory_gb"]:
+            d_blockers.append(f"Memory {fmt_req_limit(c_mem_gb, exa_env_limits['memory_gb'], 'GB')}")
+        if c_iops > exa_env_limits["iops"]:
+            d_blockers.append(f"IOPS {fmt_req_limit(c_iops, exa_env_limits['iops'], 'IOPS', 0)}")
+
+        cohort_matrix.append(
+            {
+                "cohort": c,
+                "largest_instance": largest.instance if largest else "N/A",
+                "largest_db_name": model.display_db_name(largest.db) if largest else "N/A",
+                "base_fit": base_fit_c,
+                "base_reason": "Fit" if base_fit_c else f"Not Fit: {base_blockers[0]}",
+                "xs_fit": len(blockers) == 0,
+                "xs_reason": "Fit" if len(blockers) == 0 else f"Not Fit: {blockers[0]}",
+                "d_fit": len(d_blockers) == 0,
+                "d_reason": "Fit" if len(d_blockers) == 0 else f"Not Fit: {d_blockers[0]}",
+                "required_ecpu": c_cpu,
+                "required_vcpu": c_vcpu,
+                "required_storage_tb": c_storage_tb,
+            }
+        )
+
+    xs_fit = len(xs_failures) == 0
+    xs_reason = "Fit for all cohorts." if xs_fit else f"Not Fit: {xs_failures[0]}"
+
+    # Exadata Dedicated inventory for all cohorts consolidated.
+    global_s = model.summary()
+    req_vcpu = float(global_s.get("vcpu_total") or 0.0)
+    req_cpu = req_vcpu * ECPU_PER_VCPU_EXADATA
+    req_mem_gb = float(global_s.get("memory_gb_total") or 0.0)
+    req_storage_tb = float(global_s.get("allocated_storage_gb") or 0.0) / 1024.0
+    req_iops = max((float(v) for _, v in model.iops_by_cohort()), default=0.0)
+
+    exa_envs = max(
+        1,
+        int(
+            math.ceil(
+                max(
+                    req_cpu / exa_env_limits["ecpu"] if exa_env_limits["ecpu"] > 0 else 0.0,
+                    req_mem_gb / exa_env_limits["memory_gb"] if exa_env_limits["memory_gb"] > 0 else 0.0,
+                    req_storage_tb / exa_env_limits["storage_tb"] if exa_env_limits["storage_tb"] > 0 else 0.0,
+                    req_iops / exa_env_limits["iops"] if exa_env_limits["iops"] > 0 else 0.0,
+                )
+            )
+        ),
+    )
+    per_env_cpu = req_cpu / exa_envs
+    per_env_mem = req_mem_gb / exa_envs
+    per_env_storage = req_storage_tb / exa_envs
+    per_env_iops = req_iops / exa_envs
+
+    db_servers_per_env = max(
+        1,
+        int(
+            math.ceil(
+                max(
+                    per_env_cpu / exa_server_capacity["db_ecpu"] if exa_server_capacity["db_ecpu"] > 0 else 0.0,
+                    per_env_mem / exa_server_capacity["db_memory_gb"] if exa_server_capacity["db_memory_gb"] > 0 else 0.0,
+                )
+            )
+        ),
+    )
+    storage_servers_per_env = max(
+        1,
+        int(
+            math.ceil(
+                max(
+                    per_env_storage / exa_server_capacity["storage_tb"] if exa_server_capacity["storage_tb"] > 0 else 0.0,
+                    per_env_iops / exa_server_capacity["storage_iops"] if exa_server_capacity["storage_iops"] > 0 else 0.0,
+                )
+            )
+        ),
+    )
+    exa_db_servers_total = db_servers_per_env * exa_envs
+    exa_storage_servers_total = storage_servers_per_env * exa_envs
+    exa_fit = True
+    exa_reason = (
+        "Fit in a single environment."
+        if exa_envs == 1
+        else f"Fit with scale-out: single environment is insufficient; requires {exa_envs} environments."
+    )
+
+    if base_fit:
+        tier, pos, confidence = "Base Database", 1, 0.86
+    elif xs_fit:
+        tier, pos, confidence = "Exascale", 2, 0.80
+    else:
+        tier, pos, confidence = "Exadata Dedicated", 3, 0.78
+
+    inventory_rows = [
+        {
+            "platform": "Base Database",
+            "fit": "Fit" if base_fit else "Not Fit",
+            "inventory": f"{total_instances} deployments | {base_db_servers} DB servers",
+            "reason": base_reason,
+        },
+        {
+            "platform": "Exascale",
+            "fit": "Fit" if xs_fit else "Not Fit",
+            "inventory": f"{total_cohorts} deployments (1 per cohort)",
+            "reason": xs_reason,
+        },
+        {
+            "platform": "Exadata Dedicated",
+            "fit": "Fit" if exa_fit else "Not Fit",
+            "inventory": (
+                f"{exa_envs} environment(s) | {exa_db_servers_total} DB servers | "
+                f"{exa_storage_servers_total} Storage servers"
+            ),
+            "reason": exa_reason,
+        },
+    ]
+
+    footnotes = [
+        "[1] Base DB thresholds used by script: 256 ECPU, 512 GB memory, 80 TB storage, 8k IOPS per instance.",
+        "[2] Exascale thresholds used by script: 200 ECPU and 100 TB per cohort deployment.",
+        "[3] Exadata-family conversion used by script: 1 vCPU = 2 ECPU for Exascale and Exadata Dedicated sizing.",
+        "[4] Exadata Dedicated memory policy used by script: 70% of one DB server memory (1390 GB) => 973 GB per cohort limit.",
+        "[5] Exadata server sizing assumptions for inventory: ~380 ECPU and ~973 GB memory policy per DB server (70% of 1390 GB); ~300 TB and ~15M IOPS per Storage server.",
+    ]
+
+    return {
+        "tier": tier,
+        "pos": pos,
+        "confidence": confidence,
+        "cohort_matrix": cohort_matrix,
+        "inventory_rows": inventory_rows,
+        "base_failures": base_failures,
+        "xs_failures": xs_failures,
+        "xs_cohort_details": xs_cohort_details,
+        "exadata_envs": exa_envs,
+        "base_limits": base_limits,
+        "xs_limits": xs_limits,
+        "exa_env_limits": exa_env_limits,
+        "exa_one_db_server_memory_gb": exa_one_db_server_memory_gb,
+        "exa_cohort_memory_limit_gb": exa_cohort_memory_limit_gb,
+        "exa_server_capacity": exa_server_capacity,
+        "base_db_servers": base_db_servers,
+        "exadata_db_servers_total": exa_db_servers_total,
+        "exadata_storage_servers_total": exa_storage_servers_total,
+        "required_vcpu_total": req_vcpu,
+        "required_ecpu_total": req_cpu,
+        "required_memory_gb_total": req_mem_gb,
+        "required_storage_tb_total": req_storage_tb,
+        "required_iops_total": req_iops,
+        "footnotes": footnotes,
+    }
+
+
+def infra_progress_values(pos: int, score: float) -> list[float]:
+    s = max(0.0, min(100.0, float(score)))
+    if pos <= 1:
+        p1 = min(100.0, (s / 35.0) * 100.0)
+        return [p1, 0.0, 0.0]
+    if pos == 2:
+        p2 = min(100.0, ((s - 35.0) / 35.0) * 100.0)
+        return [100.0, max(0.0, p2), 0.0]
+    p3 = min(100.0, ((s - 70.0) / 30.0) * 100.0)
+    return [100.0, 100.0, max(0.0, p3)]
+
+
+def add_infra_progress_chart(slide, values: list[float], x: float, y: float, w: float, h: float):
+    data = CategoryChartData()
+    data.categories = ["Base Database", "Exascale", "Exadata Dedicated"]
+    data.add_series("Infrastructure fit (%)", values)
+    chart = slide.shapes.add_chart(
+        XL_CHART_TYPE.BAR_CLUSTERED,
+        Inches(x),
+        Inches(y),
+        Inches(w),
+        Inches(h),
+        data,
+    ).chart
+    chart.has_legend = False
+    chart.value_axis.minimum_scale = 0
+    chart.value_axis.maximum_scale = 100
+    chart.value_axis.has_major_gridlines = False
+    chart.value_axis.tick_labels.font.name = "Oracle Sans Tab"
+    chart.value_axis.tick_labels.font.size = Pt(8)
+    chart.category_axis.tick_labels.font.name = "Oracle Sans Tab"
+    chart.category_axis.tick_labels.font.size = Pt(9)
+    plot = chart.plots[0]
+    plot.vary_by_categories = True
+    try:
+        pts = chart.series[0].points
+        if len(pts) >= 3:
+            pts[0].format.fill.solid()
+            pts[0].format.fill.fore_color.rgb = ORACLE_COLORS["accent6"]
+            pts[1].format.fill.solid()
+            pts[1].format.fill.fore_color.rgb = ORACLE_COLORS["accent4"]
+            pts[2].format.fill.solid()
+            pts[2].format.fill.fore_color.rgb = ORACLE_COLORS["accent3"]
+    except Exception:
+        pass
+
+
+def summary_dba_learnings(
+    model: "Model",
+    s: dict[str, float],
+    total_db: int,
+    total_instances: int,
+    total_hosts: int,
+    total_cohorts: int,
+    versions: list[tuple[str, int]],
+    cpu_stats: list[tuple[str, dict[str, float]]],
+    iops_items: list[tuple[str, float]],
+) -> list[str]:
+    lines: list[str] = []
+    lines.append(
+        f"Scope baseline: {total_db} DBs, {total_instances} instances, {total_hosts} hosts across {total_cohorts} cohorts."
+    )
+    if versions:
+        top_ver, top_ver_cnt = versions[0]
+        lines.append(f"Most common version is {top_ver} ({top_ver_cnt}/{max(total_db,1)} DBs, {pct(top_ver_cnt, max(total_db,1)):.1f}%).")
+
+    used = float(s.get("used_storage_gb") or 0.0)
+    alloc = float(s.get("allocated_storage_gb") or 0.0)
+    util = pct(used, alloc)
+    if alloc > 0:
+        lines.append(f"Storage utilization is {util:.1f}% ({fmt_num(used,1)} GB used of {fmt_num(alloc,1)} GB allocated).")
+        if util >= 80.0:
+            lines.append("Storage headroom is limited; prioritize growth planning and tiering before expansion events.")
+
+    mem_total = float(s.get("memory_gb_total") or 0.0)
+    mem_ded = float(s.get("sga_total") or 0.0) + float(s.get("pga_total") or 0.0)
+    mem_share = pct(mem_ded, mem_total)
+    if mem_total > 0:
+        lines.append(f"Instance-dedicated memory (SGA+PGA) is {mem_share:.1f}% of host memory in scope.")
+        if mem_share < 45.0:
+            lines.append("Memory appears over-provisioned for current workload; consider right-sizing or consolidation.")
+
+    if iops_items:
+        top_iops = max(iops_items, key=lambda kv: kv[1])
+        lines.append(f"Highest cohort IOPS is {top_iops[0]} at {fmt_num(top_iops[1],0)} IOPS.")
+        if top_iops[1] >= 50000:
+            lines.append("Sustained high IOPS suggests evaluating Exadata or equivalent high-throughput architecture.")
+
+    if cpu_stats:
+        top_cpu = max(cpu_stats, key=lambda kv: kv[1].get("p95", 0.0))
+        lines.append(f"Highest CPU p95 is in {top_cpu[0]} at {fmt_num(top_cpu[1].get('p95',0.0),2)}.")
+
+    return lines[:5]
+
+
+def cohort_dba_learnings(
+    model: "Model",
+    cohort: str,
+    rs: list["Row"],
+    sm: dict[str, float],
+    versions: list[tuple[str, int]],
+    inst_stats: list[tuple[str, dict[str, float]]],
+    mem_items_c: list[tuple[str, float]],
+    iops_items_c: list[tuple[str, float]],
+) -> list[str]:
+    total_db = int(sm["db_count"])
+    total_hosts = int(sm["host_count"])
+    total_instances = int(sm["instance_count"])
+    lines: list[str] = [
+        f"Cohort baseline: {total_db} DBs, {total_instances} instances, {total_hosts} hosts."
+    ]
+    if versions:
+        top_ver, top_ver_cnt = versions[0]
+        lines.append(f"Most common DB version is {top_ver} ({top_ver_cnt}/{max(total_db,1)} DBs, {pct(top_ver_cnt, max(total_db,1)):.1f}%).")
+
+    mem_total = float(sm.get("memory_gb_total") or 0.0)
+    mem_ded = float(sm.get("sga_total") or 0.0) + float(sm.get("pga_total") or 0.0)
+    mem_share = pct(mem_ded, mem_total)
+    if mem_total > 0:
+        lines.append(f"SGA+PGA is {mem_share:.1f}% of host memory in this cohort.")
+        if mem_share < 45.0:
+            lines.append("Cohort indicates memory over-allocation versus database memory footprint.")
+
+    if inst_stats:
+        top_cpu = max(inst_stats, key=lambda kv: kv[1].get("p95", 0.0))
+        lines.append(f"Highest instance CPU p95: {short_label(top_cpu[0],20)} at {fmt_num(top_cpu[1].get('p95',0.0),2)}.")
+
+    if iops_items_c:
+        top_iops_db = max(iops_items_c, key=lambda kv: kv[1])
+        lines.append(f"Highest DB IOPS: {short_label(top_iops_db[0],20)} at {fmt_num(top_iops_db[1],0)}.")
+        if top_iops_db[1] >= 30000:
+            lines.append("This cohort has high IO pressure and is a potential candidate for Exadata consolidation.")
+
+    if mem_items_c:
+        top_mem_db = max(mem_items_c, key=lambda kv: kv[1])
+        lines.append(f"Highest DB memory p95: {short_label(top_mem_db[0],20)} at {fmt_num(top_mem_db[1],1)} GB.")
+
+    return lines[:5]
+
+
+def instance_dba_comment(model: "Model", cohort: str, db: str, inst: str, row: "Row" | None) -> str:
+    cpu_stats = model.db_metric_stats(cohort, db, "DB vCPU") or {}
+    iops_stats = model.db_metric_stats(cohort, db, "DB IOPS") or {}
+    mem_stats = model.db_metric_stats(cohort, db, "DB Memory (MB)") or {}
+    mem_total = float(row.mem_gb if row else 0.0)
+    mem_ded = float((row.sga_gb if row else 0.0) + (row.pga_gb if row else 0.0))
+    mem_share = pct(mem_ded, mem_total)
+    cpu_p95 = float(cpu_stats.get("p95") or 0.0)
+    iops_p95 = float(iops_stats.get("p95") or 0.0)
+    mem_p95_gb = float(mem_stats.get("p95") or 0.0) / 1024.0
+    recommendations: list[str] = []
+
+    if mem_total > 0 and mem_share < 40.0:
+        recommendations.append(f"Dedicated DB memory is {mem_share:.1f}% of host memory; consider right-sizing.")
+    if iops_p95 >= 30000 or cpu_p95 >= 24.0:
+        recommendations.append("Observed IO/CPU pressure is elevated; evaluate Exadata for performance and consolidation.")
+    if mem_p95_gb > 0 and mem_total > 0 and mem_p95_gb < (0.5 * mem_total):
+        recommendations.append("DB memory demand is materially below host memory; review consolidation opportunities.")
+    if not recommendations:
+        recommendations.append("CPU, memory and IO indicators are within expected range for this instance scope.")
+
+    return short_label(f"DBA assessment: {recommendations[0]}", 120)
 
 
 @dataclass
@@ -938,8 +1444,10 @@ def add_table(
     w: float,
     h: float,
     numeric_cols: set[int] | None = None,
+    fit_cols: set[int] | None = None,
 ):
     numeric_cols = numeric_cols or set()
+    fit_cols = fit_cols or set()
     t = slide.shapes.add_table(len(rows) + 1, len(headers), Inches(x), Inches(y), Inches(w), Inches(h)).table
     for j, htxt in enumerate(headers):
         cell = t.cell(0, j)
@@ -956,8 +1464,16 @@ def add_table(
         for j, v in enumerate(row):
             cell = t.cell(i, j)
             cell.text = v
-            cell.fill.solid()
-            cell.fill.fore_color.rgb = RGBColor(0xF2, 0xF5, 0xF7) if i % 2 else RGBColor(0xE8, 0xED, 0xF1)
+            txt = str(v or "").strip().lower()
+            if j in fit_cols and txt.startswith("fit"):
+                cell.fill.solid()
+                cell.fill.fore_color.rgb = RGBColor(0xD9, 0xF2, 0xE3)  # light green
+            elif j in fit_cols and txt.startswith("no fit"):
+                cell.fill.solid()
+                cell.fill.fore_color.rgb = RGBColor(0xF9, 0xDD, 0xDD)  # light red
+            else:
+                cell.fill.solid()
+                cell.fill.fore_color.rgb = RGBColor(0xF2, 0xF5, 0xF7) if i % 2 else RGBColor(0xE8, 0xED, 0xF1)
             p = cell.text_frame.paragraphs[0]
             p.font.name = "Oracle Sans Tab"
             p.font.size = Pt(8)
@@ -1464,6 +1980,38 @@ def add_cohort_cpu_boxplot_chart(slide, cohort_stats: list[tuple[str, dict[str, 
 
 def build_plan(model: Model) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
+    out.append(
+        {
+            "id": "executive-summary",
+            "type": "executive-summary",
+            "title": "Executive summary: INTERNAL ORACLE - Not to share with customer",
+            "subtitle": "DBA analytical overview and deployment recommendation",
+        }
+    )
+    out.append(
+        {
+            "id": "deployment-base",
+            "type": "deployment-base",
+            "title": "Service Fit Metrics - Base Database",
+            "subtitle": "Informative slide: fit parameters, formulas, thresholds, and references",
+        }
+    )
+    out.append(
+        {
+            "id": "deployment-exascale",
+            "type": "deployment-exascale",
+            "title": "Service Fit Metrics - Exascale",
+            "subtitle": "Informative slide: fit parameters, formulas, thresholds, and references",
+        }
+    )
+    out.append(
+        {
+            "id": "deployment-exadata",
+            "type": "deployment-exadata",
+            "title": "Service Fit Metrics - Exadata Dedicated",
+            "subtitle": "Informative slide: fit parameters, formulas, thresholds, and references",
+        }
+    )
     out.append({"id": "title", "type": "title", "title": "AWR Analysis", "subtitle": "Generated report overview"})
     out.append(
         {
@@ -1510,6 +2058,7 @@ def export_ppt(input_path: Path, template_path: Path, output_path: Path):
         raw = payload
         ui = {}
     model = Model(raw, ui)
+    ai_payload = get_ai_app_payload(ui)
 
     prs = presentation_from_template(template_path)
     # Prefer explicit layout mapping from template sample slides:
@@ -1522,9 +2071,342 @@ def export_ppt(input_path: Path, template_path: Path, output_path: Path):
     layout_blank_light = find_layout(prs, ["light - blank", "blank", "title 1 column"])
     clear_existing_slides(prs)
 
+    infra_eval_all = infra_assessment(model, ai_payload)
     plan = build_plan(model)
     for item in plan:
         t = item["type"]
+        if t == "executive-summary":
+            slide = prs.slides.add_slide(layout_content)
+            s = model.summary()
+            total_db = int(s.get("db_count") or 0)
+            total_hosts = int(s.get("host_count") or 0)
+            total_instances = int(s.get("instance_count") or 0)
+            total_cohorts = len(model.cohorts())
+            iops_items = model.iops_by_cohort()
+            infra_eval = infra_eval_all
+
+            set_title_and_subtitle(
+                slide,
+                "Executive summary: INTERNAL ORACLE - Not to share with customer",
+                f"Scope: {total_db} DBs | {total_instances} instances | {total_hosts} hosts | {total_cohorts} cohorts",
+            )
+            max_iops = max((float(v) for _, v in iops_items), default=0.0)
+            tier = str(infra_eval["tier"])
+            conf = float(infra_eval["confidence"])
+            req_vcpu = float(s.get("vcpu_total") or 0.0)
+            req_ecpu = float(infra_eval.get("required_ecpu_total") or (req_vcpu * ECPU_PER_VCPU_EXADATA))
+            req_storage_tb = float(s.get("allocated_storage_gb") or 0.0) / 1024.0
+            req_memory_gb = float(s.get("memory_gb_total") or 0.0)
+            req_iops = float(max_iops)
+
+            add_exec_cards(
+                slide,
+                [
+                    {"value": fmt_num(req_ecpu, 1), "label": "Required ECPUs (approx)", "sub": "from total vCPU", "color": ORACLE_COLORS["accent1"]},
+                    {"value": f"{req_storage_tb:.1f} TB", "label": "Required Storage", "sub": "allocated footprint", "color": ORACLE_COLORS["accent2"]},
+                    {"value": f"{req_memory_gb/1024.0:.1f} TB", "label": "Required Memory", "sub": f"{fmt_num(req_memory_gb,1)} GB", "color": ORACLE_COLORS["accent5"]},
+                    {"value": fmt_num(req_iops, 0), "label": "Peak Cohort IOPS", "sub": "p95/peak indicator", "color": ORACLE_COLORS["accent3"]},
+                    {"value": tier, "label": "Recommended Platform", "sub": f"conf {conf:.2f}", "color": ORACLE_COLORS["accent1"]},
+                ],
+            )
+
+            add_section_label(slide, "Cohort Deployment Fit (Bottom-Up)", 0.79, 3.02)
+            # Requirements summary matrix for deployment decisions.
+            selected_rows = model.selected_rows()
+            base_limits = infra_eval.get("base_limits") or {}
+            xs_limits = infra_eval.get("xs_limits") or {}
+            exa_limits = infra_eval.get("exa_env_limits") or {}
+            exa_envs = max(1, int(infra_eval.get("exadata_envs") or 1))
+            per_env_ecpu = req_ecpu / exa_envs
+            per_env_mem = req_memory_gb / exa_envs
+            per_env_storage = req_storage_tb / exa_envs
+            per_env_iops = req_iops / exa_envs
+
+            max_inst_cpu = max((float(r.init_cpu_count or r.logical_cpu_count or 0.0) for r in selected_rows), default=0.0)
+            max_inst_mem = max((float(r.mem_gb or 0.0) for r in selected_rows), default=0.0)
+            max_inst_sga = max((float(r.sga_gb or 0.0) for r in selected_rows), default=0.0)
+            max_inst_pga = max((float(r.pga_gb or 0.0) for r in selected_rows), default=0.0)
+            max_inst_storage = 0.0
+            max_inst_iops = 0.0
+            for r in selected_rows:
+                st = model.db_metric_stats(r.cohort, r.db, "Allocated Storage (GB)") or {}
+                max_inst_storage = max(max_inst_storage, float(st.get("p95") or st.get("max") or 0.0) / 1024.0)
+                it = model.db_metric_stats(r.cohort, r.db, "DB IOPS") or {}
+                max_inst_iops = max(max_inst_iops, float(it.get("p95") or it.get("max") or 0.0))
+
+            max_cohort_vcpu = max((float(model.summary(model.rows_for_cohort(c)).get("vcpu_total") or 0.0) for c in model.cohorts()), default=0.0)
+            max_cohort_ecpu = max_cohort_vcpu * ECPU_PER_VCPU_EXADATA
+            max_cohort_storage = max((float(model.summary(model.rows_for_cohort(c)).get("allocated_storage_gb") or 0.0) / 1024.0 for c in model.cohorts()), default=0.0)
+
+            cpu_series = model.cpu_series_global()
+            all_cpu_points = [v for _, _, ys in cpu_series for v in ys]
+            cpu_p95 = quantile(sorted(all_cpu_points), 0.95) if all_cpu_points else 0.0
+            vcpu_usage_pct = pct(cpu_p95, req_vcpu)
+
+            rac_flags = {model.db_is_rac(r.db) for r in selected_rows}
+            rac_state = "Mixed" if len(rac_flags) > 1 else ("Yes" if True in rac_flags else "No")
+
+            def fit_txt(req: float, lim: float, unit: str, dec: int = 1) -> str:
+                st = "Fit" if req <= lim else "Not Fit"
+                return f"{st} ({fmt_num(req, dec)}/{fmt_num(lim, dec)} {unit})"
+
+            matrix_rows = [
+                [
+                    "VCPU total",
+                    f"{fmt_num(req_vcpu,1)} vCPU",
+                    f"Per-instance max: {fit_txt(max_inst_cpu, float(base_limits.get('ecpu', 0.0)), 'ECPU', 1)}",
+                    f"Largest cohort: {fit_txt(max_cohort_ecpu, float(xs_limits.get('ecpu', 0.0)), 'ECPU', 1)}",
+                    f"Per env: {fit_txt(per_env_ecpu, float(exa_limits.get('ecpu', 0.0)), 'ECPU', 1)}",
+                ],
+                [
+                    "VCPU Usage %",
+                    f"{vcpu_usage_pct:.1f}%",
+                    "Advisory metric",
+                    "Advisory metric",
+                    "Advisory metric",
+                ],
+                [
+                    "Memory",
+                    f"{fmt_num(req_memory_gb,1)} GB",
+                    f"Per-instance max: {fit_txt(max_inst_mem, float(base_limits.get('memory_gb', 0.0)), 'GB', 1)}",
+                    "Resource-scaled",
+                    f"Per env: {fit_txt(per_env_mem, float(exa_limits.get('memory_gb', 0.0)), 'GB', 1)}",
+                ],
+                [
+                    "Storage",
+                    f"{fmt_num(req_storage_tb,1)} TB",
+                    f"Per-instance max: {fit_txt(max_inst_storage, float(base_limits.get('storage_tb', 0.0)), 'TB', 1)}",
+                    f"Largest cohort: {fit_txt(max_cohort_storage, float(xs_limits.get('storage_tb', 0.0)), 'TB', 1)}",
+                    f"Per env: {fit_txt(per_env_storage, float(exa_limits.get('storage_tb', 0.0)), 'TB', 1)}",
+                ],
+                [
+                    "IOPS",
+                    fmt_num(req_iops, 0),
+                    f"Per-instance max: {fit_txt(max_inst_iops, float(base_limits.get('iops', 0.0)), 'IOPS', 0)}",
+                    "Resource profile",
+                    f"Per env: {fit_txt(per_env_iops, float(exa_limits.get('iops', 0.0)), 'IOPS', 0)}",
+                ],
+                [
+                    "SGA",
+                    f"{fmt_num(s.get('sga_total') or 0.0,1)} GB",
+                    f"Max instance: {fmt_num(max_inst_sga,1)} GB",
+                    "Included in memory profile",
+                    "Included in env memory sizing",
+                ],
+                [
+                    "PGA",
+                    f"{fmt_num(s.get('pga_total') or 0.0,1)} GB",
+                    f"Max instance: {fmt_num(max_inst_pga,1)} GB",
+                    "Included in memory profile",
+                    "Included in env memory sizing",
+                ],
+                [
+                    "RAC",
+                    rac_state,
+                    "RAC instances count as 2 DB servers",
+                    "One Exascale deployment per cohort",
+                    "All cohorts consolidated in Exadata Dedicated",
+                ],
+            ]
+            add_table(
+                slide,
+                headers=["Requirement", "Current Scope", "Base Database", "Exadata Exascale (ExaDB-XS)", "Exadata Dedicated (ExaDB-D)"],
+                rows=matrix_rows,
+                x=0.79,
+                y=3.20,
+                w=12.0,
+                h=2.35,
+                fit_cols={2, 3, 4},
+            )
+            add_panel(
+                slide,
+                "Warning",
+                [
+                    "INTERNAL ORACLE ONLY - do not share this slide with customer.",
+                    "This recommendation is deterministic from AWR quantitative metrics.",
+                    "Validate final positioning with Oracle solution architecture review.",
+                ],
+                x=0.79,
+                y=5.62,
+                w=12.0,
+                h=1.0,
+                dark=False,
+                body_font_size=12,
+            )
+            if tier == "Base Database":
+                sizing_line = f"Sizing target: {total_instances} Base Databases (one per instance)."
+            elif tier == "Exascale":
+                sizing_line = f"Sizing target: {total_cohorts} Exascale deployments (one per cohort), hosting {total_instances} instances."
+            else:
+                sizing_line = (
+                    f"Sizing target: {infra_eval.get('exadata_envs', 1)} Exadata Dedicated environment(s), "
+                    f"{infra_eval.get('exadata_db_servers_total', 0)} DB servers and "
+                    f"{infra_eval.get('exadata_storage_servers_total', 0)} Storage servers."
+                )
+            add_footer_note(slide, sizing_line, x=0.8, y=6.90, w=11.9)
+            continue
+
+        if t == "deployment-base":
+            slide = prs.slides.add_slide(layout_content)
+            set_title_and_subtitle(slide, item["title"], item.get("subtitle", ""))
+            base_limits = infra_eval_all.get("base_limits") or {}
+            add_exec_cards(
+                slide,
+                [
+                    {"value": "Per Instance", "label": "Sizing Scope", "sub": "Each DB instance is evaluated independently", "color": ORACLE_COLORS["accent1"]},
+                    {"value": f"{fmt_num(base_limits.get('ecpu', 0),0)} ECPU", "label": "CPU Threshold", "sub": "Per instance", "color": ORACLE_COLORS["accent5"]},
+                    {"value": f"{fmt_num(base_limits.get('memory_gb', 0),0)} GB", "label": "Memory Threshold", "sub": "Per instance", "color": ORACLE_COLORS["accent3"]},
+                    {"value": f"{fmt_num(base_limits.get('storage_tb', 0),0)} TB", "label": "Storage Threshold", "sub": "Per instance", "color": ORACLE_COLORS["accent1"]},
+                    {"value": f"{fmt_num(base_limits.get('iops', 0),0)} IOPS", "label": "IOPS Threshold", "sub": "Per instance", "color": ORACLE_COLORS["accent2"]},
+                ],
+            )
+            add_section_label(slide, "Base Database Sizing Limits", 0.79, 3.02)
+            map_rows = [
+                ["CPU", f"{fmt_num(base_limits.get('ecpu',0),0)}", "ECPU", "Maximum CPU per instance"],
+                ["Memory", f"{fmt_num(base_limits.get('memory_gb',0),0)}", "GB", "Maximum memory per instance"],
+                ["Allocated Storage", f"{fmt_num(base_limits.get('storage_tb',0),0)}", "TB", "Maximum allocated storage per instance"],
+                ["IOPS", f"{fmt_num(base_limits.get('iops',0),0)}", "IOPS", "Maximum IOPS per instance"],
+                ["RAC Rule", "2 DB servers", "count", "If an instance is RAC, count two DB servers in inventory"],
+            ]
+            add_table(
+                slide,
+                headers=["Parameter", "Limit", "Unit", "Notes"],
+                rows=map_rows,
+                x=0.79,
+                y=3.20,
+                w=12.0,
+                h=3.55,
+            )
+            add_footer_note(
+                slide,
+                "[A] Citations: oracle-base-database-service.pdf | p.30 | Table 1-2 Flexible Shapes; p.33 | Table 1-4 Available data storage; p.7 | Service limits.",
+                x=0.8,
+                y=6.93,
+                w=11.9,
+            )
+            continue
+
+        if t == "deployment-exascale":
+            slide = prs.slides.add_slide(layout_content)
+            set_title_and_subtitle(slide, item["title"], item.get("subtitle", ""))
+            xs_limits = infra_eval_all.get("xs_limits") or {}
+            add_exec_cards(
+                slide,
+                [
+                    {"value": "Per Cohort", "label": "Sizing Scope", "sub": "One Exascale deployment per cohort", "color": ORACLE_COLORS["accent1"]},
+                    {"value": "vCPU x 2", "label": "CPU Conversion", "sub": "Exadata-family conversion", "color": ORACLE_COLORS["accent2"]},
+                    {"value": "8", "label": "Min ECPU / VM", "sub": "Capacity limit", "color": ORACLE_COLORS["accent5"]},
+                    {"value": "200", "label": "Max ECPU / VM", "sub": "Capacity limit", "color": ORACLE_COLORS["accent3"]},
+                    {"value": "10", "label": "Max VMs / Cluster", "sub": "Capacity limit", "color": ORACLE_COLORS["accent1"]},
+                ],
+            )
+            add_section_label(slide, "Exascale Sizing Limits", 0.79, 3.02)
+            xs_rows = [
+                ["Minimum VM cluster size", "Single-node VM cluster", "cluster", "Baseline deployment minimum"],
+                ["Minimum ECPUs per VM", "8", "ECPU/VM", "Capacity lower bound"],
+                ["Maximum ECPUs per VM", "200", "ECPU/VM", "Capacity upper bound"],
+                ["Maximum VMs in VM cluster", "10", "VMs", "Cluster size upper bound"],
+                ["File system storage per VM (min)", "220 (26ai) / 260 (19c)", "GB/VM", "Minimum billed capacity"],
+                ["File system storage per VM (max)", "2", "TB/VM", "Capacity upper bound"],
+                ["Exascale Vault DB storage (min)", "300", "GB/VM cluster", "Minimum cluster database storage"],
+                ["Memory scaling granularity", "2.75", "GB per total ECPU", "Scaling increment"],
+                ["Current script cohort thresholds", f"{fmt_num(xs_limits.get('ecpu',0),0)} ECPU and {fmt_num(xs_limits.get('storage_tb',0),0)} TB", "per cohort", "Internal policy threshold"],
+            ]
+            add_table(
+                slide,
+                headers=["Parameter", "Limit", "Unit", "Notes"],
+                rows=xs_rows,
+                x=0.79,
+                y=3.20,
+                w=12.0,
+                h=3.55,
+            )
+            add_footer_note(
+                slide,
+                "[B] Citations: Getting Started with Oracle Exadata Database Service on Exascale Infrastructure Deployment.pdf | p.30-p31 | Capacity limits and VM storage capacities. oracle-exadata-exascale-users-guide-exscl.pdf | p.31-p32 | Resource management context.",
+                x=0.8,
+                y=6.93,
+                w=11.9,
+            )
+            continue
+
+        if t == "deployment-exadata":
+            slide = prs.slides.add_slide(layout_content)
+            set_title_and_subtitle(slide, item["title"], item.get("subtitle", ""))
+            exa_limits = infra_eval_all.get("exa_env_limits") or {}
+            add_exec_cards(
+                slide,
+                [
+                    {"value": "vCPU x 2", "label": "CPU Conversion", "sub": "Exadata-family ECPU conversion", "color": ORACLE_COLORS["accent1"]},
+                    {"value": f"{fmt_num(exa_limits.get('ecpu', 0),0)}", "label": "Usable ECPUs / System", "sub": "X11M minimum config reference", "color": ORACLE_COLORS["accent2"]},
+                    {"value": f"{fmt_num(exa_limits.get('memory_gb', 0),0)} GB", "label": "Memory Limit / Cohort", "sub": "70% of one DB server memory", "color": ORACLE_COLORS["accent5"]},
+                    {"value": f"{fmt_num(exa_limits.get('storage_tb', 0),0)} TB", "label": "Storage Envelope", "sub": "Sizing policy upper envelope", "color": ORACLE_COLORS["accent3"]},
+                    {"value": f"{fmt_num(exa_limits.get('iops', 0),0)}", "label": "IOPS Envelope", "sub": "Sizing policy upper envelope", "color": ORACLE_COLORS["accent1"]},
+                ],
+            )
+            add_section_label(slide, "Exadata Dedicated Sizing Limits", 0.79, 3.02)
+            exa_rows = [
+                [
+                    "Total usable ECPUs in DB servers per system",
+                    f"{fmt_num(exa_limits.get('ecpu',0),0)}",
+                    "ECPU/system",
+                    "Minimum configuration property",
+                ],
+                [
+                    "Cohort memory limit (policy)",
+                    f"{fmt_num(exa_limits.get('memory_gb',0),0)}",
+                    "GB/cohort",
+                    "70% of one DB server memory (1390 GB)",
+                ],
+                [
+                    "Starting infrastructure footprint",
+                    "2 DB servers + 3 Storage servers",
+                    "count",
+                    "Baseline in X11M dedicated model",
+                ],
+                [
+                    "Database server scale range",
+                    "2 to 32",
+                    "DB servers",
+                    "Horizontal scale options",
+                ],
+                [
+                    "Storage server scale range",
+                    "3 to 64",
+                    "Storage servers",
+                    "Horizontal scale options",
+                ],
+                [
+                    "ECPU activation increment",
+                    "In multiples based on DB server count",
+                    "ECPU step",
+                    "Operational scaling granularity",
+                ],
+                [
+                    "Minimum enabled ECPUs",
+                    "0",
+                    "ECPU",
+                    "Minimum (default) configuration property",
+                ],
+            ]
+            add_table(
+                slide,
+                headers=["Parameter", "Limit", "Unit", "Notes"],
+                rows=exa_rows,
+                x=0.79,
+                y=3.20,
+                w=12.0,
+                h=3.55,
+            )
+            add_footer_note(
+                slide,
+                "[C] Citations: exadata-database-service-dedicated-infrastructure-administrators-guide.pdf | p.31 | Scaling operations; p.33 | Exadata shape configuration; p.34 | ECPU and memory limits. Policy applied: cohort memory cap = 70% of one DB server memory (1390 GB => 973 GB).",
+                x=0.8,
+                y=6.93,
+                w=11.9,
+            )
+            continue
+
         if t == "title":
             slide = prs.slides.add_slide(layout_title)
             set_title_and_subtitle(slide, item["title"], f"Generated on {datetime.now().strftime('%Y-%m-%d %H:%M')}")
@@ -1608,12 +2490,12 @@ def export_ppt(input_path: Path, template_path: Path, output_path: Path):
             versions_lines = []
             top_versions = versions[:4]
             for ver, count in top_versions:
-                pct = 100.0 * count / max(total_db, 1)
-                versions_lines.append(f"{ver}: {count}/{total_db} DBs ({pct:.1f}%)")
+                pct_val = 100.0 * count / max(total_db, 1)
+                versions_lines.append(f"{ver}: {count}/{total_db} DBs ({pct_val:.1f}%)")
             if len(versions) > 4:
                 others = sum(c for _, c in versions[4:])
-                pct = 100.0 * others / max(total_db, 1)
-                versions_lines.append(f"Others: {others}/{total_db} DBs ({pct:.1f}%)")
+                pct_val = 100.0 * others / max(total_db, 1)
+                versions_lines.append(f"Others: {others}/{total_db} DBs ({pct_val:.1f}%)")
             add_big_versions_card(
                 slide,
                 "Database Versions",
@@ -1624,15 +2506,17 @@ def export_ppt(input_path: Path, template_path: Path, output_path: Path):
                 h=1.58,
             )
 
-            cohorts_sorted = sorted(model.by_cohort_table(), key=lambda r: r["mem"], reverse=True)
-            top2_mem = sum(r["mem"] for r in cohorts_sorted[:2])
-            total_mem = sum(r["mem"] for r in cohorts_sorted) or 1.0
-            learned = [
-                f"Selected scope: {total_db} DBs, {total_instances} instances, {total_hosts} hosts, {total_cohorts} cohorts.",
-                f"Top DB version: {top_ver[0]} with {int(top_ver[1])} databases ({100.0 * top_ver[1] / max(total_db,1):.1f}%).",
-                f"Aggregate capacity: {fmt_num(s['memory_gb_total'],1)} GB memory, {fmt_num(s['vcpu_total'],1)} vCPU, {fmt_num(s['allocated_storage_gb'],1)} GB allocated storage.",
-                f"Top 2 cohorts account for {100.0 * top2_mem / total_mem:.1f}% of selected memory.",
-            ]
+            learned = summary_dba_learnings(
+                model=model,
+                s=s,
+                total_db=total_db,
+                total_instances=total_instances,
+                total_hosts=total_hosts,
+                total_cohorts=total_cohorts,
+                versions=versions,
+                cpu_stats=cpu_cohort_stats,
+                iops_items=iops_items,
+            )
             add_panel(slide, "What We Learned", learned, x=0.79, y=3.15, w=7.6, h=1.58, dark=False, body_font_size=14)
             c_y = 5.05
             c_h = 1.65
@@ -1716,12 +2600,12 @@ def export_ppt(input_path: Path, template_path: Path, output_path: Path):
             versions_lines = []
             top_versions = versions[:4]
             for ver, count in top_versions:
-                pct = 100.0 * count / max(total_db, 1)
-                versions_lines.append(f"{ver}: {count}/{total_db} DBs ({pct:.1f}%)")
+                pct_val = 100.0 * count / max(total_db, 1)
+                versions_lines.append(f"{ver}: {count}/{total_db} DBs ({pct_val:.1f}%)")
             if len(versions) > 4:
                 others = sum(cn for _, cn in versions[4:])
-                pct = 100.0 * others / max(total_db, 1)
-                versions_lines.append(f"Others: {others}/{total_db} DBs ({pct:.1f}%)")
+                pct_val = 100.0 * others / max(total_db, 1)
+                versions_lines.append(f"Others: {others}/{total_db} DBs ({pct_val:.1f}%)")
             add_big_versions_card(
                 slide,
                 "Database Versions",
@@ -1732,19 +2616,6 @@ def export_ppt(input_path: Path, template_path: Path, output_path: Path):
                 h=1.58,
             )
 
-            db_cnt = defaultdict(int)
-            for r in rs:
-                db_cnt[r.db] += 1
-            top2_db = sorted(db_cnt.items(), key=lambda kv: (-kv[1], kv[0]))[:2]
-            top2_instances = sum(n for _, n in top2_db)
-            learned = [
-                f"Cohort scope: {total_db} DBs, {total_instances} instances, {total_hosts} hosts.",
-                f"Top DB version: {top_ver[0]} with {int(top_ver[1])} databases ({100.0 * top_ver[1] / max(total_db,1):.1f}%).",
-                f"Aggregate capacity: {fmt_num(sm['memory_gb_total'],1)} GB memory, {fmt_num(sm['vcpu_total'],1)} vCPU, {fmt_num(sm['allocated_storage_gb'],1)} GB allocated storage.",
-                f"Top 2 DBs in cohort account for {100.0 * top2_instances / max(total_instances,1):.1f}% of instances.",
-            ]
-            add_panel(slide, "What We Learned", learned, x=0.79, y=3.15, w=7.6, h=1.58, dark=False, body_font_size=14)
-
             cohort_freshness = model.freshness_ranges_by_instance_in_cohort(c)
             mem_items_c = model.metric_by_db(c, "DB Memory (MB)", scale=(1.0 / 1024.0))
             iops_items_c = model.metric_by_db(c, "DB IOPS", scale=1.0)
@@ -1753,6 +2624,18 @@ def export_ppt(input_path: Path, template_path: Path, output_path: Path):
                 st = stats_from_values(ys)
                 if st:
                     inst_stats.append((inst_name, st))
+
+            learned = cohort_dba_learnings(
+                model=model,
+                cohort=c,
+                rs=rs,
+                sm=sm,
+                versions=versions,
+                inst_stats=inst_stats,
+                mem_items_c=mem_items_c,
+                iops_items_c=iops_items_c,
+            )
+            add_panel(slide, "What We Learned", learned, x=0.79, y=3.15, w=7.6, h=1.58, dark=False, body_font_size=14)
 
             c_y = 5.05
             c_h = 1.65
@@ -1889,6 +2772,7 @@ def export_ppt(input_path: Path, template_path: Path, output_path: Path):
                 title_text="CPU Consumption (Box Plot)",
                 value_scale=1.0,
             )
+            add_footer_note(slide, instance_dba_comment(model, c, db, inst, row), x=0.8, y=1.50, w=11.9)
             continue
 
         if t == "closing":

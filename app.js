@@ -53,6 +53,21 @@ const state = {
   exportInProgress: false,
   templateApiAvailable: null,
   templatePath: '',
+  aiChat: {
+    panelOpen: false,
+    connected: false,
+    connectionSource: 'unknown',
+    connectionError: '',
+    model: 'gpt-4.1-mini',
+    messages: [],
+    docs: [],
+    question: '',
+    prompt: '',
+    response: '',
+    appPayload: null,
+    payloadErrors: [],
+    busy: false,
+  },
 };
 
 const $ = (id) => document.getElementById(id);
@@ -64,6 +79,9 @@ const CHART_SIZE_STORAGE_KEY = 'awr_review_chart_sizes_v1';
 const CARD_SPAN_STORAGE_KEY = 'awr_review_card_spans_v1';
 const CARD_HEIGHT_STORAGE_KEY = 'awr_review_card_heights_v1';
 const CHART_TYPE_STORAGE_KEY = 'awr_review_chart_types_v1';
+const CHATBOT_ENABLED = false;
+const INFRA_TIERS = ['Base Database', 'Exascale', 'Exadata Dedicated', 'Exadata Cloud Services Dedicated'];
+const AWR_DBA_ADVISOR_URL = 'https://chatgpt.com/g/g-69d9751bd6008191afe58d05e76405b6-awr-dba-advisor';
 
 function fmt(n, kind) {
   if (n == null || Number.isNaN(Number(n))) return 'N/A';
@@ -188,6 +206,151 @@ function setStatus(text) {
   $('fileStatus').textContent = text;
 }
 
+function truncateText(s, max = 4000) {
+  const t = String(s || '');
+  if (t.length <= max) return t;
+  return `${t.slice(0, max)}\n...[truncated ${t.length - max} chars]`;
+}
+
+function escapeForPromptJson(v) {
+  try {
+    return JSON.stringify(v, null, 2);
+  } catch {
+    return String(v);
+  }
+}
+
+function isObj(x) {
+  return x && typeof x === 'object' && !Array.isArray(x);
+}
+
+function validateStringArray(arr, path, errors, maxItems = 20) {
+  if (!Array.isArray(arr)) {
+    errors.push(`${path} must be an array.`);
+    return;
+  }
+  if (arr.length > maxItems) errors.push(`${path} must have at most ${maxItems} items.`);
+  arr.forEach((v, i) => {
+    if (typeof v !== 'string' || !v.trim()) errors.push(`${path}[${i}] must be a non-empty string.`);
+  });
+}
+
+function validateMapOfStringArrays(obj, path, errors, maxItems = 12) {
+  if (!isObj(obj)) {
+    errors.push(`${path} must be an object.`);
+    return;
+  }
+  Object.entries(obj).forEach(([k, v]) => {
+    if (!String(k).trim()) errors.push(`${path} has an empty key.`);
+    validateStringArray(v, `${path}.${k}`, errors, maxItems);
+  });
+}
+
+function validateAppPayload(payload) {
+  const errors = [];
+  if (!isObj(payload)) {
+    return { valid: false, errors: ['Payload must be a JSON object.'] };
+  }
+  const required = [
+    'global_comments',
+    'cohort_comments',
+    'instance_comments',
+    'infrastructure_recommendation',
+    'assumptions',
+    'data_gaps',
+  ];
+  required.forEach((k) => {
+    if (!(k in payload)) errors.push(`Missing required field: ${k}.`);
+  });
+  const allowedTop = new Set(required);
+  Object.keys(payload).forEach((k) => {
+    if (!allowedTop.has(k)) errors.push(`Unexpected top-level field: ${k}.`);
+  });
+
+  validateStringArray(payload.global_comments, 'global_comments', errors, 12);
+  validateMapOfStringArrays(payload.cohort_comments, 'cohort_comments', errors, 12);
+  validateMapOfStringArrays(payload.instance_comments, 'instance_comments', errors, 12);
+  validateStringArray(payload.assumptions, 'assumptions', errors, 20);
+  validateStringArray(payload.data_gaps, 'data_gaps', errors, 20);
+
+  const infra = payload.infrastructure_recommendation;
+  if (!isObj(infra)) {
+    errors.push('infrastructure_recommendation must be an object.');
+  } else {
+    const infraReq = [
+      'recommended_tier',
+      'scale_position',
+      'rationale',
+      'deployment_plan',
+      'cohort_tier_suggestions',
+      'instance_tier_suggestions',
+      'confidence',
+    ];
+    infraReq.forEach((k) => {
+      if (!(k in infra)) errors.push(`Missing infrastructure_recommendation.${k}.`);
+    });
+    const allowedInfra = new Set(infraReq);
+    Object.keys(infra).forEach((k) => {
+      if (!allowedInfra.has(k)) errors.push(`Unexpected infrastructure_recommendation field: ${k}.`);
+    });
+    if (!INFRA_TIERS.includes(infra.recommended_tier)) {
+      errors.push('infrastructure_recommendation.recommended_tier has invalid value.');
+    }
+    if (![1, 2, 3].includes(infra.scale_position)) {
+      errors.push('infrastructure_recommendation.scale_position must be 1, 2, or 3.');
+    }
+    const expectedPos =
+      infra.recommended_tier === 'Base Database'
+        ? 1
+        : infra.recommended_tier === 'Exascale'
+          ? 2
+          : (infra.recommended_tier === 'Exadata Cloud Services Dedicated' || infra.recommended_tier === 'Exadata Dedicated')
+            ? 3
+            : null;
+    if (expectedPos != null && infra.scale_position !== expectedPos) {
+      errors.push('infrastructure_recommendation.scale_position does not match recommended_tier.');
+    }
+    validateStringArray(infra.rationale, 'infrastructure_recommendation.rationale', errors, 12);
+    if (!isObj(infra.deployment_plan)) {
+      errors.push('infrastructure_recommendation.deployment_plan must be an object.');
+    } else {
+      if (infra.deployment_plan.base_database !== 'one Base Database per instance') {
+        errors.push('deployment_plan.base_database invalid.');
+      }
+      if (infra.deployment_plan.exascale !== 'one Exascale deployment per cohort') {
+        errors.push('deployment_plan.exascale invalid.');
+      }
+      if (infra.deployment_plan.exadata_dedicated !== 'all cohorts consolidated in Exadata Dedicated') {
+        errors.push('deployment_plan.exadata_dedicated invalid.');
+      }
+    }
+    if (!isObj(infra.cohort_tier_suggestions)) {
+      errors.push('infrastructure_recommendation.cohort_tier_suggestions must be an object.');
+    } else {
+      Object.entries(infra.cohort_tier_suggestions).forEach(([k, v]) => {
+        if (!INFRA_TIERS.includes(v)) errors.push(`cohort_tier_suggestions.${k} invalid tier.`);
+      });
+    }
+    if (!isObj(infra.instance_tier_suggestions)) {
+      errors.push('infrastructure_recommendation.instance_tier_suggestions must be an object.');
+    } else {
+      Object.entries(infra.instance_tier_suggestions).forEach(([k, v]) => {
+        if (!INFRA_TIERS.includes(v)) errors.push(`instance_tier_suggestions.${k} invalid tier.`);
+      });
+    }
+    if (typeof infra.confidence !== 'number' || Number.isNaN(infra.confidence) || infra.confidence < 0 || infra.confidence > 1) {
+      errors.push('infrastructure_recommendation.confidence must be a number between 0 and 1.');
+    }
+  }
+  return { valid: errors.length === 0, errors };
+}
+
+function stripJsonCodeFence(text) {
+  const raw = String(text || '').trim();
+  const m = raw.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  return m ? m[1].trim() : raw;
+}
+
 function updateTemplateStatusText() {
   const node = $('templateStatus');
   if (!node) return;
@@ -290,6 +453,22 @@ function reportStateSnapshot() {
       chartSizes: state.chartSizes || {},
       chartTypes: state.chartTypes || {},
       pptSlidesSelected: [...(state.pptSlideSelected || [])],
+      aiChat: {
+        panelOpen: Boolean(state.aiChat?.panelOpen),
+        connected: Boolean(state.aiChat?.connected),
+        connectionSource: state.aiChat?.connectionSource || 'unknown',
+        model: state.aiChat?.model || 'gpt-4.1-mini',
+        messages: (state.aiChat?.messages || []).map((m) => ({
+          role: m.role === 'assistant' ? 'assistant' : 'user',
+          content: String(m.content || ''),
+        })),
+        docs: (state.aiChat?.docs || []).map((d) => ({ name: d.name, content: d.content })),
+        question: state.aiChat?.question || '',
+        prompt: state.aiChat?.prompt || '',
+        response: state.aiChat?.response || '',
+        appPayload: state.aiChat?.appPayload || null,
+        payloadErrors: Array.isArray(state.aiChat?.payloadErrors) ? state.aiChat.payloadErrors : [],
+      },
     },
   };
 }
@@ -321,6 +500,29 @@ function applySavedUiState(uiState = {}) {
   state.cardHeights = uiState.cardHeights && typeof uiState.cardHeights === 'object' ? uiState.cardHeights : {};
   state.chartTypes = uiState.chartTypes && typeof uiState.chartTypes === 'object' ? uiState.chartTypes : {};
   state.pptSlideSelected = new Set(Array.isArray(uiState.pptSlidesSelected) ? uiState.pptSlidesSelected : []);
+  const ai = uiState.aiChat && typeof uiState.aiChat === 'object' ? uiState.aiChat : {};
+  state.aiChat = {
+    panelOpen: Boolean(ai.panelOpen),
+    connected: Boolean(ai.connected),
+    connectionSource: String(ai.connectionSource || 'unknown'),
+    model: String(ai.model || 'gpt-4.1-mini'),
+    messages: Array.isArray(ai.messages)
+      ? ai.messages
+          .filter((m) => m && typeof m.content === 'string')
+          .map((m) => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: String(m.content || '') }))
+      : [],
+    docs: Array.isArray(ai.docs)
+      ? ai.docs
+          .filter((d) => d && typeof d.name === 'string')
+          .map((d) => ({ name: d.name, content: String(d.content || '') }))
+      : [],
+    question: String(ai.question || ''),
+    prompt: String(ai.prompt || ''),
+    response: String(ai.response || ''),
+    appPayload: ai.appPayload && typeof ai.appPayload === 'object' ? ai.appPayload : null,
+    payloadErrors: Array.isArray(ai.payloadErrors) ? ai.payloadErrors.map((x) => String(x || '')) : [],
+    busy: false,
+  };
 
   applySavedCardSpans();
   applySavedCardHeights();
@@ -1081,6 +1283,8 @@ function selectedInstances(kind) {
 }
 
 function slideBadge(slide) {
+  if (slide.type === 'executive-summary') return 'EXEC';
+  if (slide.type?.startsWith('deployment-')) return 'DEPLOY';
   if (slide.type === 'title') return 'TITLE';
   if (slide.type === 'summary') return 'SUMMARY';
   if (slide.type === 'separator') return 'SEPARATOR';
@@ -1098,6 +1302,30 @@ function buildPptSlidePlan() {
 
   const cohorts = [...byCohort.keys()].sort((a, b) => a.localeCompare(b));
   const plan = [];
+  plan.push({
+    id: 'executive-summary',
+    type: 'executive-summary',
+    title: 'Executive Summary',
+    subtitle: 'DBA analytical overview and deployment recommendation',
+  });
+  plan.push({
+    id: 'deployment-base',
+    type: 'deployment-base',
+    title: 'Service Fit Metrics - Base Database',
+    subtitle: 'Informative slide: fit parameters, formulas, thresholds, and references',
+  });
+  plan.push({
+    id: 'deployment-exascale',
+    type: 'deployment-exascale',
+    title: 'Service Fit Metrics - Exascale',
+    subtitle: 'Informative slide: fit parameters, formulas, thresholds, and references',
+  });
+  plan.push({
+    id: 'deployment-exadata',
+    type: 'deployment-exadata',
+    title: 'Service Fit Metrics - Exadata Dedicated',
+    subtitle: 'Informative slide: fit parameters, formulas, thresholds, and references',
+  });
   plan.push({ id: 'title', type: 'title', title: 'AWR Analysis', subtitle: 'Generated report overview' });
   plan.push({ id: 'summary-global', type: 'summary', title: 'Global Summary', subtitle: 'All selected databases and cohorts' });
   plan.push({ id: 'sep-cohorts', type: 'separator', title: 'Cohort Analysis', subtitle: 'Cohort-level drill down' });
@@ -1889,6 +2117,110 @@ async function probeTemplateApi() {
     state.templatePath = '';
     updateTemplateStatusText();
     return false;
+  }
+}
+
+async function probeAiConnection() {
+  try {
+    const res = await fetch('/api/chat-status', { method: 'GET' });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json().catch(() => ({}));
+    state.aiChat.connected = Boolean(data?.connected);
+    state.aiChat.connectionSource = data?.source || 'unknown';
+    state.aiChat.model = data?.model || state.aiChat.model || 'gpt-4.1-mini';
+    state.aiChat.connectionError = data?.error || '';
+    renderAiChatAssistant();
+    return state.aiChat.connected;
+  } catch {
+    state.aiChat.connected = false;
+    state.aiChat.connectionSource = 'unavailable';
+    state.aiChat.connectionError = 'Connection check failed.';
+    renderAiChatAssistant();
+    return false;
+  }
+}
+
+async function sendAiMessage() {
+  const question = (state.aiChat.question || '').trim();
+  if (!question) {
+    setStatus('Type a question first.');
+    return;
+  }
+  const connected = await probeAiConnection();
+  if (!connected) {
+    await sendAiViaWeb();
+    return;
+  }
+  const prompt = buildAiPromptText();
+  state.aiChat.prompt = prompt;
+  state.aiChat.busy = true;
+  state.aiChat.messages = [...(state.aiChat.messages || []), { role: 'user', content: question }];
+  renderAiChatAssistant();
+
+  try {
+    const res = await fetch('/api/chat-assistant', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: state.aiChat.model || 'gpt-4.1-mini',
+        messages: [
+          { role: 'system', content: 'You are an Oracle AWR analyst. Respond with factual and quantitative findings first.' },
+          { role: 'user', content: prompt },
+        ],
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data?.ok) {
+      throw new Error(data?.error || `HTTP ${res.status}`);
+    }
+    const answer = String(data.answer || '').trim() || 'No response content.';
+    state.aiChat.response = answer;
+    try {
+      const parsed = JSON.parse(stripJsonCodeFence(answer));
+      const check = validateAppPayload(parsed);
+      if (check.valid) {
+        state.aiChat.appPayload = parsed;
+        state.aiChat.payloadErrors = [];
+      } else {
+        state.aiChat.appPayload = null;
+        state.aiChat.payloadErrors = check.errors;
+      }
+    } catch {
+      // non-JSON assistant responses are allowed; user can paste APP_PAYLOAD manually
+    }
+    state.aiChat.messages = [...(state.aiChat.messages || []), { role: 'assistant', content: answer }];
+    state.aiChat.question = '';
+    setStatus('AI response received.');
+  } catch (err) {
+    setStatus(`AI request failed: ${err?.message || err}`);
+  } finally {
+    state.aiChat.busy = false;
+    renderAiChatAssistant();
+  }
+}
+
+async function sendAiViaWeb() {
+  const basePrompt = state.aiChat.prompt || buildAiPromptText();
+  const prompt = `${basePrompt}\n\nIMPORTANT: Return APP_PAYLOAD JSON only (no markdown), valid for app_payload.schema.json.`;
+  state.aiChat.prompt = prompt;
+  try {
+    if (navigator?.clipboard?.writeText) {
+      await navigator.clipboard.writeText(prompt);
+    } else {
+      const ta = document.createElement('textarea');
+      ta.value = prompt;
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      ta.remove();
+    }
+    window.open(AWR_DBA_ADVISOR_URL, '_blank', 'noopener,noreferrer');
+    setStatus('Prompt copied. AWR DBA Advisor opened. Paste and send there.');
+  } catch {
+    window.open(AWR_DBA_ADVISOR_URL, '_blank', 'noopener,noreferrer');
+    setStatus('AWR DBA Advisor opened. Copy prompt manually from the panel and paste there.');
+  } finally {
+    renderAiChatAssistant();
   }
 }
 
@@ -2710,7 +3042,7 @@ function selectedPreviewSlides() {
 
 function previewDetailForSlide(slide, rows, byCohort) {
   let detail = slide.subtitle || '';
-  if (slide.type === 'summary') {
+  if (slide.type === 'summary' || slide.type === 'executive-summary' || slide.type?.startsWith('deployment-')) {
     const g = computeGlobal('ppt');
     detail = `${fmt(g.db_count, 'int')} DBs | ${fmt(g.instance_count, 'int')} instances | ${fmt(g.host_count, 'int')} hosts`;
   }
@@ -2727,7 +3059,7 @@ function previewDetailForSlide(slide, rows, byCohort) {
 }
 
 function previewKpisForSlide(slide, rows, byCohort) {
-  if (slide.type === 'summary') {
+  if (slide.type === 'summary' || slide.type === 'executive-summary' || slide.type?.startsWith('deployment-')) {
     const g = computeGlobal('ppt');
     return [
       { k: 'DBs', v: fmt(g.db_count, 'int') },
@@ -2765,7 +3097,7 @@ function previewKpisForSlide(slide, rows, byCohort) {
 }
 
 function previewRowsForSlide(slide, rows, byCohort) {
-  if (slide.type === 'summary') {
+  if (slide.type === 'summary' || slide.type === 'executive-summary' || slide.type?.startsWith('deployment-')) {
     return computeByCohort('ppt')
       .slice(0, 5)
       .map((r) => [r.cohort, fmt(r.dbs, 'int'), fmt(r.instances, 'int'), fmt(r.vcpu, 'dec1')]);
@@ -2795,6 +3127,10 @@ function previewRowsForSlide(slide, rows, byCohort) {
 
 function buildSlideMockHtml(slide, detail, compact = false, rows = [], byCohort = new Map(), chartImgs = null) {
   const chips = [];
+  if (slide.type === 'executive-summary') chips.push('Executive Analysis', 'Infrastructure Fit');
+  if (slide.type === 'deployment-base') chips.push('Base Database', 'Detailed Sizing');
+  if (slide.type === 'deployment-exascale') chips.push('Exascale', 'Detailed Sizing');
+  if (slide.type === 'deployment-exadata') chips.push('Exadata Dedicated', 'Detailed Sizing');
   if (slide.type === 'title') chips.push('Cover Slide');
   if (slide.type === 'summary') chips.push('Global KPIs', 'Cohort Table');
   if (slide.type === 'separator') chips.push('Section Divider');
@@ -2834,7 +3170,7 @@ function buildSlideMockHtml(slide, detail, compact = false, rows = [], byCohort 
   let tableHtml = '';
   if (!compact && dataRows.length) {
     const hdr =
-      slide.type === 'summary'
+      slide.type === 'summary' || slide.type === 'executive-summary'
         ? ['Cohort', 'DBs', 'Inst', 'vCPU']
         : slide.type === 'cohort'
           ? ['Database', 'Instances']
@@ -3542,7 +3878,10 @@ function mirrorIfLinked(originKind) {
 }
 
 function renderAll() {
-  if (!state.graph) return;
+  if (!state.graph) {
+    renderAiChatAssistant();
+    return;
+  }
   ensureValidSelection('web');
   ensureValidSelection('ppt');
   renderSelectors();
@@ -3553,8 +3892,144 @@ function renderAll() {
   renderPageMode();
   renderCpuScaleToggleLabel();
   renderPptStoryboard();
+  renderAiChatAssistant();
   syncResizableCharts();
   syncChartTypeControls();
+}
+
+function buildAiPromptText() {
+  const docs = (state.aiChat?.docs || []).map((d) => `### ${d.name}\n${truncateText(d.content, 5000)}`).join('\n\n');
+  const question = (state.aiChat?.question || '').trim();
+
+  if (!state.graph) {
+    return [
+      'You are assisting with Oracle AWR analysis.',
+      'No AWR JSON is loaded yet. Base your answer only on the user question and additional docs.',
+      '',
+      '## User Question',
+      question || 'Provide a concise analysis based on the loaded documentation.',
+      '',
+      '## Additional Documentation',
+      docs || 'No extra documents loaded.',
+      '',
+      '## Response Format',
+      '1) Key findings (quantitative where possible)',
+      '2) Risks / anomalies',
+      '3) Suggested next checks',
+    ].join('\n');
+  }
+
+  const kind = state.activeTab === 'ppt' ? 'ppt' : 'web';
+  const sel = state.selection[kind];
+  const rows = selectedInstances(kind);
+  const global = computeGlobal(kind);
+  const byCohort = computeByCohort(kind).map((r) => ({
+    cohort: r.cohort,
+    dbs: r.dbs,
+    instances: r.instances,
+    hosts: r.hosts,
+    vcpu: Number((r.vcpu || 0).toFixed(3)),
+    memory_gb: Number((r.mem || 0).toFixed(3)),
+  }));
+
+  const context = {
+    scope: {
+      mode: kind,
+      selected_cohorts: [...sel.cohorts],
+      selected_dbs: [...sel.dbs],
+      selected_instances: [...sel.instances],
+      selected_metrics: [...sel.metrics],
+      selected_rows_count: rows.length,
+    },
+    summary: global,
+    cohorts: byCohort,
+  };
+
+  return [
+    'You are assisting with Oracle AWR analysis.',
+    'Use the context below and answer with factual, quantitative points first.',
+    '',
+    '## User Question',
+    question || 'Provide a concise analysis of the selected scope.',
+    '',
+    '## AWR Context (from current app selection)',
+    '```json',
+    escapeForPromptJson(context),
+    '```',
+    '',
+    '## Additional Documentation',
+    docs || 'No extra documents loaded.',
+    '',
+    '## Response Format',
+    '1) Key findings (quantitative)',
+    '2) Risks / anomalies',
+    '3) Suggested next checks',
+  ].join('\n');
+}
+
+function renderAiChatAssistant() {
+  const panel = $('aiPanel');
+  const floatBtn = $('aiFloatBtn');
+  const statusNode = $('aiConnectionStatus');
+  const payloadStatusNode = $('aiPayloadStatus');
+  const sendBtn = $('aiSendBtn');
+  const msgNode = $('aiMessages');
+  const docsNode = $('aiDocsList');
+  const qNode = $('aiUserQuestion');
+  const pNode = $('aiPromptOutput');
+  const rNode = $('aiChatResponse');
+  if (!docsNode || !qNode || !pNode || !rNode || !panel || !floatBtn || !statusNode || !msgNode) return;
+  if (!CHATBOT_ENABLED) {
+    panel.classList.remove('open');
+    panel.setAttribute('aria-hidden', 'true');
+    panel.style.display = 'none';
+    floatBtn.style.display = 'none';
+    return;
+  }
+
+  panel.classList.toggle('open', Boolean(state.aiChat.panelOpen));
+  panel.setAttribute('aria-hidden', state.aiChat.panelOpen ? 'false' : 'true');
+  floatBtn.textContent = state.aiChat.panelOpen ? 'Close AI' : 'AI Assistant';
+  if (state.aiChat.connected) {
+    statusNode.textContent = `Connected (${state.aiChat.connectionSource}) • Model: ${state.aiChat.model}`;
+  } else if (state.aiChat.connectionError) {
+    statusNode.textContent = `Not connected: ${state.aiChat.connectionError} Use "Send to AWR DBA Advisor".`;
+  } else if (state.aiChat.connectionSource === 'unavailable') {
+    statusNode.textContent = 'Connection check failed. Ensure app_server.py is running, or use "Send to AWR DBA Advisor".';
+  } else {
+    statusNode.textContent = 'Not connected. Will try loading OPENAI_API_KEY from ~/.codex/auth.json or .env, or use "Send to AWR DBA Advisor".';
+  }
+  if (sendBtn) sendBtn.disabled = Boolean(state.aiChat.busy);
+
+  docsNode.innerHTML = (state.aiChat.docs || []).length
+    ? state.aiChat.docs
+        .map(
+          (d) =>
+            `<div class="ai-doc-item"><span>${esc(d.name)}</span><span>${fmt((d.content || '').length, 'int')} chars</span></div>`,
+        )
+        .join('')
+    : '<p class="muted">No extra docs loaded.</p>';
+
+  msgNode.innerHTML = (state.aiChat.messages || []).length
+    ? state.aiChat.messages
+        .slice(-12)
+        .map((m) => `<div class="ai-msg ${m.role === 'assistant' ? 'assistant' : 'user'}"><strong>${m.role}:</strong> ${esc(m.content)}</div>`)
+        .join('')
+    : '<p class="muted">Start a conversation about the loaded AWR data.</p>';
+
+  qNode.value = state.aiChat.question || '';
+  pNode.value = state.aiChat.prompt || '';
+  rNode.value = state.aiChat.response || '';
+  if (payloadStatusNode) {
+    if (state.aiChat.appPayload) {
+      const infra = state.aiChat.appPayload?.infrastructure_recommendation || {};
+      payloadStatusNode.textContent = `APP_PAYLOAD validated. Tier: ${infra.recommended_tier || 'N/A'} | Scale: ${infra.scale_position || 'N/A'}`;
+    } else if (state.aiChat.payloadErrors?.length) {
+      payloadStatusNode.textContent = `APP_PAYLOAD invalid: ${state.aiChat.payloadErrors[0]}`;
+    } else {
+      payloadStatusNode.textContent = 'No APP_PAYLOAD validated yet.';
+    }
+  }
 }
 
 function initEvents() {
@@ -3773,6 +4248,130 @@ function initEvents() {
     setStatus(`Report saved (${a.download}).`);
   });
 
+  if (CHATBOT_ENABLED) {
+    $('aiFloatBtn')?.addEventListener('click', async () => {
+      state.aiChat.panelOpen = !state.aiChat.panelOpen;
+      renderAiChatAssistant();
+      if (state.aiChat.panelOpen) {
+        const ok = await probeAiConnection();
+        setStatus(ok ? 'AI assistant connected.' : 'AI assistant not connected. Checking ~/.codex/auth.json and .env for OPENAI_API_KEY.');
+      }
+    });
+
+    $('aiPanelCloseBtn')?.addEventListener('click', () => {
+      state.aiChat.panelOpen = false;
+      renderAiChatAssistant();
+    });
+
+    $('aiDocsInput')?.addEventListener('change', async (e) => {
+      const files = [...(e.target.files || [])];
+      if (!files.length) return;
+      const accepted = [];
+      for (const f of files) {
+        const lower = String(f.name || '').toLowerCase();
+        if (!lower.match(/\.(txt|md|json|csv|log)$/)) continue;
+        try {
+          const content = await f.text();
+          accepted.push({ name: f.name, content: truncateText(content, 12000) });
+        } catch {
+          // ignore unreadable file
+        }
+      }
+      if (accepted.length) {
+        state.aiChat.docs = [...state.aiChat.docs, ...accepted];
+        setStatus(`Loaded ${accepted.length} doc(s) for AI context.`);
+        renderAiChatAssistant();
+      } else {
+        setStatus('No supported docs loaded. Use .txt, .md, .json, .csv, or .log');
+      }
+      e.target.value = '';
+    });
+
+    $('aiClearDocsBtn')?.addEventListener('click', () => {
+      state.aiChat.docs = [];
+      renderAiChatAssistant();
+      setStatus('AI docs cleared.');
+    });
+
+    $('aiUserQuestion')?.addEventListener('input', (e) => {
+      state.aiChat.question = e.target.value;
+    });
+
+    $('aiChatResponse')?.addEventListener('input', (e) => {
+      state.aiChat.response = e.target.value;
+    });
+
+    $('aiBuildPromptBtn')?.addEventListener('click', () => {
+      state.aiChat.prompt = buildAiPromptText();
+      renderAiChatAssistant();
+      setStatus('AI prompt generated.');
+    });
+
+    $('aiSendBtn')?.addEventListener('click', async () => {
+      await sendAiMessage();
+    });
+
+    $('aiWebModeBtn')?.addEventListener('click', async () => {
+      await sendAiViaWeb();
+    });
+
+    $('aiCopyPromptBtn')?.addEventListener('click', async () => {
+      const prompt = state.aiChat.prompt || buildAiPromptText();
+      state.aiChat.prompt = prompt;
+      try {
+        if (navigator?.clipboard?.writeText) {
+          await navigator.clipboard.writeText(prompt);
+        } else {
+          const ta = document.createElement('textarea');
+          ta.value = prompt;
+          document.body.appendChild(ta);
+          ta.select();
+          document.execCommand('copy');
+          ta.remove();
+        }
+        renderAiChatAssistant();
+        setStatus('AI prompt copied to clipboard.');
+      } catch {
+        renderAiChatAssistant();
+        setStatus('Could not copy automatically. Select and copy from the prompt box.');
+      }
+    });
+
+    $('aiValidatePayloadBtn')?.addEventListener('click', () => {
+      const raw = stripJsonCodeFence(state.aiChat.response || '');
+      if (!raw) {
+        state.aiChat.appPayload = null;
+        state.aiChat.payloadErrors = ['Paste APP_PAYLOAD JSON first.'];
+        renderAiChatAssistant();
+        setStatus('APP_PAYLOAD validation failed: empty input.');
+        return;
+      }
+      try {
+        const parsed = JSON.parse(raw);
+        const check = validateAppPayload(parsed);
+        if (!check.valid) {
+          state.aiChat.appPayload = null;
+          state.aiChat.payloadErrors = check.errors;
+          renderAiChatAssistant();
+          setStatus(`APP_PAYLOAD invalid (${check.errors.length} issues).`);
+          return;
+        }
+        state.aiChat.appPayload = parsed;
+        state.aiChat.payloadErrors = [];
+        renderAiChatAssistant();
+        setStatus('APP_PAYLOAD validated and attached to report.');
+      } catch (err) {
+        state.aiChat.appPayload = null;
+        state.aiChat.payloadErrors = [`JSON parse error: ${err?.message || err}`];
+        renderAiChatAssistant();
+        setStatus('APP_PAYLOAD validation failed: invalid JSON.');
+      }
+    });
+  } else {
+    $('aiPanel')?.remove();
+    $('aiFloatBtn')?.remove();
+  }
+
   $('reportInput')?.addEventListener('change', async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -3875,4 +4474,5 @@ function initEvents() {
 }
 
 initEvents();
+renderAiChatAssistant();
 void probeTemplateApi();

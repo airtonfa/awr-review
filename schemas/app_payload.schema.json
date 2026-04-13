@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://awr-review.local/schemas/app_payload.schema.json",
+  "title": "AWR GPT App Payload",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "global_comments",
+    "cohort_comments",
+    "instance_comments",
+    "infrastructure_recommendation",
+    "assumptions",
+    "data_gaps"
+  ],
+  "properties": {
+    "global_comments": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "maxItems": 12
+    },
+    "cohort_comments": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "array",
+        "items": { "type": "string", "minLength": 1 },
+        "maxItems": 12
+      }
+    },
+    "instance_comments": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "array",
+        "items": { "type": "string", "minLength": 1 },
+        "maxItems": 12
+      }
+    },
+    "infrastructure_recommendation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "recommended_tier",
+        "scale_position",
+        "rationale",
+        "deployment_plan",
+        "cohort_tier_suggestions",
+        "instance_tier_suggestions",
+        "confidence"
+      ],
+      "properties": {
+        "recommended_tier": {
+          "type": "string",
+          "enum": ["Base Database", "Exascale", "Exadata Cloud Services Dedicated"]
+        },
+        "scale_position": { "type": "integer", "enum": [1, 2, 3] },
+        "rationale": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "minItems": 1,
+          "maxItems": 12
+        },
+        "deployment_plan": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["base_database", "exascale", "exadata_dedicated"],
+          "properties": {
+            "base_database": { "type": "string", "const": "one Base Database per instance" },
+            "exascale": { "type": "string", "const": "one Exascale deployment per cohort" },
+            "exadata_dedicated": { "type": "string", "const": "all cohorts consolidated in Exadata Dedicated" }
+          }
+        },
+        "cohort_tier_suggestions": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "enum": ["Base Database", "Exascale", "Exadata Cloud Services Dedicated"]
+          }
+        },
+        "instance_tier_suggestions": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "enum": ["Base Database", "Exascale", "Exadata Cloud Services Dedicated"]
+          }
+        },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
+      }
+    },
+    "assumptions": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "maxItems": 20
+    },
+    "data_gaps": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "maxItems": 20
+    }
+  }
+}

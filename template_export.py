@@ -31,6 +31,8 @@ from pptx.chart.data import CategoryChartData, XyChartData
 from pptx.enum.chart import XL_CHART_TYPE, XL_LEGEND_POSITION
 from pptx.enum.shapes import MSO_AUTO_SHAPE_TYPE, MSO_CONNECTOR
 from pptx.enum.text import PP_ALIGN
+from pptx.oxml.xmlchemy import OxmlElement
+from pptx.oxml.ns import qn
 from pptx.util import Inches, Pt, Cm
 from pptx.dml.color import RGBColor
 
@@ -244,6 +246,20 @@ def get_ai_app_payload(ui_state: dict[str, Any] | None) -> dict[str, Any] | None
         return None
     payload = ai.get("appPayload")
     return payload if isinstance(payload, dict) else None
+
+
+def get_report_meta(payload: dict[str, Any] | None, ui_state: dict[str, Any] | None) -> dict[str, str]:
+    src: dict[str, Any] = {}
+    if isinstance(payload, dict) and isinstance(payload.get("report_metadata"), dict):
+        src = payload.get("report_metadata") or {}
+    elif isinstance(ui_state, dict) and isinstance(ui_state.get("reportMeta"), dict):
+        src = ui_state.get("reportMeta") or {}
+    return {
+        "customerName": str(src.get("customerName") or "").strip(),
+        "salesRepName": str(src.get("salesRepName") or "").strip(),
+        "architectName": str(src.get("architectName") or "").strip(),
+        "engineerName": str(src.get("engineerName") or "").strip(),
+    }
 
 
 def pick_payload_comments(payload: dict[str, Any] | None, scope: str, key: str | None = None, max_lines: int = 4) -> list[str]:
@@ -899,10 +915,14 @@ class Model:
         return token or "UNKNOWN_DB"
 
     def instance_label(self, inst: str) -> str:
-        parts = str(inst or "").split("$")
+        token = str(inst or "")
+        m = re.match(r"^db_([^_$]+)", token, re.IGNORECASE)
+        if m and m.group(1):
+            return m.group(1)
+        parts = token.split("$")
         if len(parts) >= 3:
             return f"{parts[-2]}${parts[-1]}"
-        return str(inst or "UNKNOWN_INSTANCE")
+        return token or "UNKNOWN_INSTANCE"
 
     def db_type_and_pdb_count(self, db: str) -> tuple[str, str]:
         params = self.db_params.get(db, {})
@@ -1502,6 +1522,9 @@ def add_line_chart(
     y_max: float | None = None,
     x_tick_font_size: int = 8,
     y_tick_font_size: int = 8,
+    chart_kind: str = "line",
+    line_width_pt: float = 2.0,
+    area_transparency: float = 0.0,
 ):
     if not series:
         return
@@ -1517,8 +1540,9 @@ def add_line_chart(
         # align by downsample count
         m = min(len(labels), len(sx), len(sy))
         chart_data.add_series(short_label(name, 24), sy[:m])
+    chart_type = XL_CHART_TYPE.AREA if str(chart_kind).lower() == "area" else XL_CHART_TYPE.LINE
     chart = slide.shapes.add_chart(
-        XL_CHART_TYPE.LINE,
+        chart_type,
         Inches(x),
         Inches(y),
         Inches(w),
@@ -1544,8 +1568,34 @@ def add_line_chart(
     chart.value_axis.tick_labels.font.size = Pt(y_tick_font_size)
     chart.category_axis.tick_labels.font.size = Pt(x_tick_font_size)
     for i, s in enumerate(chart.series):
-        s.format.line.color.rgb = PALETTE[i % len(PALETTE)]
-        s.format.line.width = Pt(2)
+        color = PALETTE[i % len(PALETTE)]
+        s.format.line.color.rgb = color
+        s.format.line.width = Pt(line_width_pt)
+        if chart_type == XL_CHART_TYPE.AREA:
+            try:
+                s.format.fill.solid()
+                s.format.fill.fore_color.rgb = color
+                s.format.fill.transparency = max(0.0, min(1.0, float(area_transparency)))
+                # Force alpha in chart-series XML for PowerPoint reliability.
+                ser = s._element
+                sp_pr = ser.find(qn("c:spPr"))
+                if sp_pr is None:
+                    sp_pr = OxmlElement("c:spPr")
+                    ser.append(sp_pr)
+                for node in list(sp_pr.findall(qn("a:solidFill"))):
+                    sp_pr.remove(node)
+                solid = OxmlElement("a:solidFill")
+                srgb = OxmlElement("a:srgbClr")
+                srgb.set("val", f"{int(color[0]):02X}{int(color[1]):02X}{int(color[2]):02X}")
+                alpha = OxmlElement("a:alpha")
+                # OOXML alpha: 100000 = fully opaque, 0 = fully transparent.
+                alpha_val = int(round((1.0 - max(0.0, min(1.0, float(area_transparency)))) * 100000))
+                alpha.set("val", str(alpha_val))
+                srgb.append(alpha)
+                solid.append(srgb)
+                sp_pr.append(solid)
+            except Exception:
+                pass
 
 
 def add_bar_chart(
@@ -1870,6 +1920,7 @@ def add_freshness_timeline_chart(
         chart.value_axis.format.line.fill.background()
     for i, s in enumerate(chart.series):
         s.format.line.color.rgb = PALETTE[i % len(PALETTE)]
+        s.format.line.width = Pt(2)
         s.smooth = False
         # Label only the last point with the series (cohort/instance) name.
         try:
@@ -2059,6 +2110,7 @@ def export_ppt(input_path: Path, template_path: Path, output_path: Path):
         ui = {}
     model = Model(raw, ui)
     ai_payload = get_ai_app_payload(ui)
+    report_meta = get_report_meta(payload if isinstance(payload, dict) else {}, ui)
 
     prs = presentation_from_template(template_path)
     # Prefer explicit layout mapping from template sample slides:
@@ -2409,14 +2461,154 @@ def export_ppt(input_path: Path, template_path: Path, output_path: Path):
 
         if t == "title":
             slide = prs.slides.add_slide(layout_title)
-            set_title_and_subtitle(slide, item["title"], f"Generated on {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-            bx = slide.shapes.add_textbox(Inches(1.1), Inches(2.5), Inches(10.9), Inches(1.1))
-            tf = bx.text_frame
-            tf.text = "Executive report with global, cohort and instance drill downs."
-            tf.paragraphs[0].font.name = "Oracle Sans Tab"
-            tf.paragraphs[0].font.size = Pt(16)
-            tf.paragraphs[0].font.color.rgb = ORACLE_COLORS["text"]
-            tf.paragraphs[0].alignment = PP_ALIGN.CENTER
+            customer = report_meta.get("customerName") or ""
+            subtitle = f"AWR Analysis for: {customer}" if customer else "AWR Analysis"
+            set_title_and_subtitle(slide, item["title"], subtitle)
+
+            # Fill template placeholders:
+            # "Name" -> "Prepared by:"
+            # "Presenter's Title" -> Sales Rep / Architect / Engineer names (bold names).
+            # Some templates merge both labels into one textbox, so detect both separately
+            # and also pick a role box by position when labels are not directly matchable.
+            name_placeholder = None
+            presenter_placeholder = None
+            combined_placeholder = None
+            role_box_fallback = None
+            best_dist = None
+            target_left = Cm(2.2)
+            target_top = Cm(13.56)
+            for shp in slide.shapes:
+                if not getattr(shp, "has_text_frame", False):
+                    continue
+                if shp == slide.shapes.title:
+                    continue
+                txt = (shp.text_frame.text or "").strip()
+                norm = re.sub(r"[^a-z]+", " ", txt.lower()).strip()
+                has_name = bool(re.search(r"\bname\b", norm))
+                has_presenter = bool(re.search(r"\bpresenter\b", norm))
+                has_title = bool(re.search(r"\btitle\b", norm))
+                if has_name and has_presenter:
+                    combined_placeholder = shp
+                if has_name and name_placeholder is None:
+                    name_placeholder = shp
+                if has_presenter and (has_title or "presenter s" in norm) and presenter_placeholder is None:
+                    presenter_placeholder = shp
+                # Position fallback for role box.
+                try:
+                    dx = abs(int(shp.left) - int(target_left))
+                    dy = abs(int(shp.top) - int(target_top))
+                    dist = dx + dy
+                    if best_dist is None or dist < best_dist:
+                        best_dist = dist
+                        role_box_fallback = shp
+                except Exception:
+                    pass
+
+            role_items = [
+                ("Sales Rep", report_meta.get("salesRepName") or ""),
+                ("Architect", report_meta.get("architectName") or ""),
+                ("Engineer", report_meta.get("engineerName") or ""),
+            ]
+            role_items = [(r, n) for (r, n) in role_items if n]
+
+            # Prefer true combined placeholder when available.
+            if combined_placeholder is not None:
+                role_box = combined_placeholder
+            elif presenter_placeholder is not None:
+                role_box = presenter_placeholder
+            else:
+                role_box = role_box_fallback
+
+            # If combined placeholder is used, write "Prepared by:" + role lines in one box.
+            if role_box is not None and role_box == combined_placeholder:
+                tf = role_box.text_frame
+                tf.clear()
+                p0 = tf.paragraphs[0]
+                p0.text = "Prepared by:"
+                p0.font.name = "Oracle Sans Tab"
+                p0.font.size = Pt(16)
+                p0.font.color.rgb = ORACLE_COLORS["text"]
+                p0.alignment = PP_ALIGN.LEFT
+                for i, (role, name) in enumerate(role_items):
+                    p = tf.add_paragraph()
+                    p.text = ""
+                    run_role = p.add_run()
+                    run_role.text = f"{role}: "
+                    run_role.font.name = "Oracle Sans Tab"
+                    run_role.font.size = Pt(16)
+                    run_role.font.bold = False
+                    run_role.font.color.rgb = ORACLE_COLORS["text"]
+                    run_name = p.add_run()
+                    run_name.text = name
+                    run_name.font.name = "Oracle Sans Tab"
+                    run_name.font.size = Pt(16)
+                    run_name.font.bold = True
+                    run_name.font.color.rgb = ORACLE_COLORS["text"]
+                    p.alignment = PP_ALIGN.LEFT
+            else:
+                if name_placeholder is not None:
+                    ntf = name_placeholder.text_frame
+                    ntf.clear()
+                    p = ntf.paragraphs[0]
+                    p.text = "Prepared by:"
+                    p.font.name = "Oracle Sans Tab"
+                    p.font.size = Pt(16)
+                    p.font.color.rgb = ORACLE_COLORS["text"]
+                    p.alignment = PP_ALIGN.LEFT
+                if presenter_placeholder is not None:
+                    ptf = presenter_placeholder.text_frame
+                    ptf.clear()
+                    for i, (role, name) in enumerate(role_items):
+                        p = ptf.paragraphs[0] if i == 0 else ptf.add_paragraph()
+                        p.text = ""
+                        run_role = p.add_run()
+                        run_role.text = f"{role}: "
+                        run_role.font.name = "Oracle Sans Tab"
+                        run_role.font.size = Pt(16)
+                        run_role.font.bold = False
+                        run_role.font.color.rgb = ORACLE_COLORS["text"]
+                        run_name = p.add_run()
+                        run_name.text = name
+                        run_name.font.name = "Oracle Sans Tab"
+                        run_name.font.size = Pt(16)
+                        run_name.font.bold = True
+                        run_name.font.color.rgb = ORACLE_COLORS["text"]
+                        p.alignment = PP_ALIGN.LEFT
+                if name_placeholder is None and presenter_placeholder is None:
+                    # Last-resort fallback if template role box is not detectable.
+                    rb = slide.shapes.add_textbox(Cm(2.2), Cm(13.56), Cm(15.8), Cm(3.2))
+                    tf = rb.text_frame
+                    tf.clear()
+                    p0 = tf.paragraphs[0]
+                    p0.text = "Prepared by:"
+                    p0.font.name = "Oracle Sans Tab"
+                    p0.font.size = Pt(16)
+                    p0.font.color.rgb = ORACLE_COLORS["text"]
+                    p0.alignment = PP_ALIGN.LEFT
+                    for role, name in role_items:
+                        p = tf.add_paragraph()
+                        p.text = ""
+                        run_role = p.add_run()
+                        run_role.text = f"{role}: "
+                        run_role.font.name = "Oracle Sans Tab"
+                        run_role.font.size = Pt(16)
+                        run_role.font.bold = False
+                        run_role.font.color.rgb = ORACLE_COLORS["text"]
+                        run_name = p.add_run()
+                        run_name.text = name
+                        run_name.font.name = "Oracle Sans Tab"
+                        run_name.font.size = Pt(16)
+                        run_name.font.bold = True
+                        run_name.font.color.rgb = ORACLE_COLORS["text"]
+                        p.alignment = PP_ALIGN.LEFT
+
+            gen = slide.shapes.add_textbox(Cm(2.2), Cm(18.0), Cm(10.5), Cm(0.8))
+            gtf = gen.text_frame
+            gtf.text = f"Generated on {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+            gtf.paragraphs[0].font.name = "Oracle Sans Tab"
+            gtf.paragraphs[0].font.size = Pt(12)
+            gtf.paragraphs[0].font.color.rgb = ORACLE_COLORS["muted"]
+            gtf.paragraphs[0].alignment = PP_ALIGN.LEFT
             continue
 
         if t == "separator":
@@ -2756,6 +2948,9 @@ def export_ppt(input_path: Path, template_path: Path, output_path: Path):
                 y_max=None,
                 x_tick_font_size=4,
                 y_tick_font_size=8,
+                chart_kind="area",
+                line_width_pt=2.0,
+                area_transparency=0.9,
             )
             # Use the same sampled instance series as the line chart to keep boxplot and line fully consistent.
             vcpu_stats = None

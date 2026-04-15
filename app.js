@@ -35,6 +35,10 @@ const state = {
   },
   page: { mode: 'global', cohort: null, instance: null },
   cpuScaleMode: 'dynamic',
+  vcpuSizingTargetPct: null,
+  memorySizingTargetPct: null,
+  iopsSizingTargetPct: null,
+  storageSizingTargetPct: null,
   layoutEditMode: false,
   layoutDefaultOrder: [],
   layoutDraggingId: null,
@@ -53,6 +57,16 @@ const state = {
   exportInProgress: false,
   templateApiAvailable: null,
   templatePath: '',
+  referenceLibrary: [],
+  reportMeta: {
+    customerName: '',
+    opportunityNumber: '',
+    salesRepName: '',
+    architectName: '',
+    engineerName: '',
+  },
+  collapsedSections: {},
+  sidebarCollapsed: false,
   aiChat: {
     panelOpen: false,
     connected: false,
@@ -79,9 +93,58 @@ const CHART_SIZE_STORAGE_KEY = 'awr_review_chart_sizes_v1';
 const CARD_SPAN_STORAGE_KEY = 'awr_review_card_spans_v1';
 const CARD_HEIGHT_STORAGE_KEY = 'awr_review_card_heights_v1';
 const CHART_TYPE_STORAGE_KEY = 'awr_review_chart_types_v1';
+const SIDEBAR_COLLAPSED_STORAGE_KEY = 'awr_review_sidebar_collapsed_v1';
 const CHATBOT_ENABLED = false;
 const INFRA_TIERS = ['Base Database', 'Exascale', 'Exadata Dedicated', 'Exadata Cloud Services Dedicated'];
 const AWR_DBA_ADVISOR_URL = 'https://chatgpt.com/g/g-69d9751bd6008191afe58d05e76405b6-awr-dba-advisor';
+
+function normalizeReportMeta(meta = {}) {
+  const src = meta && typeof meta === 'object' ? meta : {};
+  return {
+    customerName: String(src.customerName || '').trim(),
+    opportunityNumber: String(src.opportunityNumber || '').trim(),
+    salesRepName: String(src.salesRepName || '').trim(),
+    architectName: String(src.architectName || '').trim(),
+    engineerName: String(src.engineerName || '').trim(),
+  };
+}
+
+function applyReportMetaToInputs() {
+  if ($('metaCustomerName')) $('metaCustomerName').value = state.reportMeta.customerName || '';
+  if ($('metaOpportunityNumber')) $('metaOpportunityNumber').value = state.reportMeta.opportunityNumber || '';
+  if ($('metaSalesRepName')) $('metaSalesRepName').value = state.reportMeta.salesRepName || '';
+  if ($('metaArchitectName')) $('metaArchitectName').value = state.reportMeta.architectName || '';
+  if ($('metaEngineerName')) $('metaEngineerName').value = state.reportMeta.engineerName || '';
+}
+
+function applySidebarCollapsedUi() {
+  const layout = $('mainLayout');
+  if (layout) layout.classList.toggle('sidebar-collapsed', Boolean(state.sidebarCollapsed));
+  const btn = $('sidebarToggleBtn');
+  if (btn) {
+    btn.textContent = '☰';
+    btn.setAttribute('aria-label', state.sidebarCollapsed ? 'Show filters' : 'Hide filters');
+    btn.title = state.sidebarCollapsed ? 'Show filters' : 'Hide filters';
+  }
+}
+
+function saveSidebarCollapsedPref() {
+  try {
+    localStorage.setItem(SIDEBAR_COLLAPSED_STORAGE_KEY, state.sidebarCollapsed ? '1' : '0');
+  } catch {
+    // ignore
+  }
+}
+
+function loadSidebarCollapsedPref() {
+  try {
+    const raw = localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY);
+    state.sidebarCollapsed = raw === '1';
+  } catch {
+    state.sidebarCollapsed = false;
+  }
+  applySidebarCollapsedUi();
+}
 
 function fmt(n, kind) {
   if (n == null || Number.isNaN(Number(n))) return 'N/A';
@@ -90,6 +153,15 @@ function fmt(n, kind) {
   if (kind === 'dec1') return new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 }).format(value);
   if (kind === 'dec3') return new Intl.NumberFormat(undefined, { maximumFractionDigits: 3 }).format(value);
   return String(value);
+}
+
+function fmtBytes(bytes) {
+  const b = Number(bytes) || 0;
+  if (b <= 0) return '0 B';
+  if (b < 1024) return `${b} B`;
+  if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)} KB`;
+  if (b < 1024 * 1024 * 1024) return `${(b / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(b / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
 function cpuFixedMax() {
@@ -368,6 +440,44 @@ function updateTemplateStatusText() {
   node.textContent = `Active Template: ${file}`;
 }
 
+function renderReferenceLibrary() {
+  const list = $('referenceBookList');
+  const status = $('referenceBookStatus');
+  if (!list || !status) return;
+  const docs = Array.isArray(state.referenceLibrary) ? state.referenceLibrary : [];
+  if (!docs.length) {
+    list.innerHTML = '<p class="muted">No reference docs found in <code>docs/</code>.</p>';
+    status.textContent = 'Reference library is empty.';
+    return;
+  }
+  status.textContent = `${fmt(docs.length, 'int')} document(s) found in docs/.`;
+  list.innerHTML = docs
+    .map((d) => {
+      const name = d?.name || d?.path || 'Document';
+      const url = String(d?.url || '').trim();
+      const size = fmtBytes(d?.size_bytes || 0);
+      return `<div class="reference-item"><a href="${escAttr(url)}" target="_blank" rel="noopener" title="${escAttr(name)}">${esc(
+        name,
+      )}</a><span class="reference-meta">${esc(size)}</span></div>`;
+    })
+    .join('');
+}
+
+async function loadReferenceLibrary() {
+  const status = $('referenceBookStatus');
+  if (status) status.textContent = 'Loading reference library...';
+  try {
+    const res = await fetch('/api/reference-library', { method: 'GET' });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json().catch(() => ({}));
+    state.referenceLibrary = Array.isArray(data?.docs) ? data.docs : [];
+  } catch {
+    state.referenceLibrary = [];
+    if (status) status.textContent = 'Reference library unavailable. Ensure app_server.py is running.';
+  }
+  renderReferenceLibrary();
+}
+
 function selectionToPojo(sel) {
   return {
     cohorts: [...(sel?.cohorts || [])],
@@ -411,6 +521,17 @@ function setDefaultsForLoadedRaw(raw) {
 
   state.drill = { cohort: null, db: null, instance: null };
   state.page = { mode: 'global', cohort: null, instance: null };
+  const defaultCpuStats = computeGlobalInstanceCpuStats('web');
+  state.vcpuSizingTargetPct = defaultCpuStats ? clampTargetPct(defaultCpuStats.p95 * 1.2) : null;
+  const defaultMemStats = computeGlobalInstanceMemoryStats('web');
+  state.memorySizingTargetPct = defaultMemStats ? clampTargetPct(defaultMemStats.p95 * 1.2) : null;
+  const defaultIopsStats = computeGlobalIopsStats('web');
+  state.iopsSizingTargetPct = defaultIopsStats ? clampTargetPct(defaultIopsStats.p95 * 1.2) : null;
+  const defaultStorageStats = computeGlobalStorageStats('web');
+  state.storageSizingTargetPct = defaultStorageStats ? clampTargetPct(defaultStorageStats.p95 * 1.2) : null;
+  state.reportMeta = normalizeReportMeta({});
+  state.collapsedSections = {};
+  applyReportMetaToInputs();
 }
 
 function enableReportActions() {
@@ -439,6 +560,7 @@ function reportStateSnapshot() {
     schema_version: 1,
     saved_at: new Date().toISOString(),
     raw_data: state.raw,
+    report_metadata: normalizeReportMeta(state.reportMeta),
     ui_state: {
       activeTab: state.activeTab,
       linkSelections: state.linkSelections,
@@ -447,11 +569,22 @@ function reportStateSnapshot() {
         ppt: selectionToPojo(state.selection.ppt),
       },
       cpuScaleMode: state.cpuScaleMode,
+      vcpuSizingTargetPct:
+        Number.isFinite(Number(state.vcpuSizingTargetPct)) ? Number(state.vcpuSizingTargetPct) : null,
+      memorySizingTargetPct:
+        Number.isFinite(Number(state.memorySizingTargetPct)) ? Number(state.memorySizingTargetPct) : null,
+      iopsSizingTargetPct:
+        Number.isFinite(Number(state.iopsSizingTargetPct)) ? Number(state.iopsSizingTargetPct) : null,
+      storageSizingTargetPct:
+        Number.isFinite(Number(state.storageSizingTargetPct)) ? Number(state.storageSizingTargetPct) : null,
       layoutOrder: getCurrentLayoutOrder(),
       cardSpans: state.cardSpans || {},
       cardHeights: state.cardHeights || {},
       chartSizes: state.chartSizes || {},
       chartTypes: state.chartTypes || {},
+      collapsedSections: state.collapsedSections || {},
+      sidebarCollapsed: Boolean(state.sidebarCollapsed),
+      reportMeta: normalizeReportMeta(state.reportMeta),
       pptSlidesSelected: [...(state.pptSlideSelected || [])],
       aiChat: {
         panelOpen: Boolean(state.aiChat?.panelOpen),
@@ -473,10 +606,9 @@ function reportStateSnapshot() {
   };
 }
 
-function applySavedUiState(uiState = {}) {
-  state.activeTab = uiState.activeTab === 'ppt' ? 'ppt' : 'web';
-  state.linkSelections = Boolean(uiState.linkSelections);
-  $('linkSelections').checked = state.linkSelections;
+function applySavedUiState(uiState = {}, reportMeta = null) {
+  state.activeTab = 'web';
+  state.linkSelections = true;
 
   const fallbackWeb = {
     cohorts: new Set(state.graph.cohorts),
@@ -495,10 +627,43 @@ function applySavedUiState(uiState = {}) {
   state.selection.ppt = selectionFromPojo(uiState.selection?.ppt, fallbackPpt);
 
   state.cpuScaleMode = uiState.cpuScaleMode === 'fixed100' ? 'fixed100' : 'dynamic';
+  state.vcpuSizingTargetPct =
+    Number.isFinite(Number(uiState.vcpuSizingTargetPct)) ? Math.max(0, Math.min(200, Number(uiState.vcpuSizingTargetPct))) : null;
+  state.memorySizingTargetPct =
+    Number.isFinite(Number(uiState.memorySizingTargetPct)) ? Math.max(0, Math.min(200, Number(uiState.memorySizingTargetPct))) : null;
+  state.iopsSizingTargetPct =
+    Number.isFinite(Number(uiState.iopsSizingTargetPct)) ? Math.max(0, Math.min(200, Number(uiState.iopsSizingTargetPct))) : null;
+  state.storageSizingTargetPct =
+    Number.isFinite(Number(uiState.storageSizingTargetPct)) ? Math.max(0, Math.min(200, Number(uiState.storageSizingTargetPct))) : null;
   state.chartSizes = uiState.chartSizes && typeof uiState.chartSizes === 'object' ? uiState.chartSizes : {};
   state.cardSpans = uiState.cardSpans && typeof uiState.cardSpans === 'object' ? uiState.cardSpans : {};
   state.cardHeights = uiState.cardHeights && typeof uiState.cardHeights === 'object' ? uiState.cardHeights : {};
   state.chartTypes = uiState.chartTypes && typeof uiState.chartTypes === 'object' ? uiState.chartTypes : {};
+  state.collapsedSections = uiState.collapsedSections && typeof uiState.collapsedSections === 'object' ? uiState.collapsedSections : {};
+  if (Object.prototype.hasOwnProperty.call(uiState || {}, 'sidebarCollapsed')) {
+    state.sidebarCollapsed = Boolean(uiState.sidebarCollapsed);
+  }
+  saveSidebarCollapsedPref();
+  applySidebarCollapsedUi();
+  state.reportMeta = normalizeReportMeta(reportMeta || uiState.reportMeta || {});
+
+  if (!Number.isFinite(Number(state.vcpuSizingTargetPct))) {
+    const defaultCpuStats = computeGlobalInstanceCpuStats('web');
+    state.vcpuSizingTargetPct = defaultCpuStats ? clampTargetPct(defaultCpuStats.p95 * 1.2) : null;
+  }
+  if (!Number.isFinite(Number(state.memorySizingTargetPct))) {
+    const defaultMemStats = computeGlobalInstanceMemoryStats('web');
+    state.memorySizingTargetPct = defaultMemStats ? clampTargetPct(defaultMemStats.p95 * 1.2) : null;
+  }
+  if (!Number.isFinite(Number(state.iopsSizingTargetPct))) {
+    const defaultIopsStats = computeGlobalIopsStats('web');
+    state.iopsSizingTargetPct = defaultIopsStats ? clampTargetPct(defaultIopsStats.p95 * 1.2) : null;
+  }
+  if (!Number.isFinite(Number(state.storageSizingTargetPct))) {
+    const defaultStorageStats = computeGlobalStorageStats('web');
+    state.storageSizingTargetPct = defaultStorageStats ? clampTargetPct(defaultStorageStats.p95 * 1.2) : null;
+  }
+  applyReportMetaToInputs();
   state.pptSlideSelected = new Set(Array.isArray(uiState.pptSlidesSelected) ? uiState.pptSlidesSelected : []);
   const ai = uiState.aiChat && typeof uiState.aiChat === 'object' ? uiState.aiChat : {};
   state.aiChat = {
@@ -529,7 +694,73 @@ function applySavedUiState(uiState = {}) {
   applyLayoutOrder(Array.isArray(uiState.layoutOrder) ? uiState.layoutOrder : state.layoutDefaultOrder);
   applyLocalPrefsToStorage();
 
-  document.querySelectorAll('.tab').forEach((t) => t.classList.toggle('active', t.dataset.tab === state.activeTab));
+}
+
+function defaultCardCollapsed(cardId) {
+  if (cardId === 'globalSummaryCard') return false;
+  return cardId !== 'globalSummaryCard';
+}
+
+function setCardCollapsedUi(card, collapsed) {
+  if (!card?.id) return;
+  const next = Boolean(collapsed);
+  state.collapsedSections[card.id] = next;
+  card.classList.add('section-collapsible');
+  card.classList.toggle('section-collapsed', next);
+  const btn = card.querySelector('.section-toggle-btn');
+  if (btn) {
+    btn.textContent = next ? '>' : '⌄';
+    btn.setAttribute('aria-expanded', String(!next));
+    btn.setAttribute('aria-label', next ? 'Expand section' : 'Collapse section');
+    btn.title = next ? 'Expand section' : 'Collapse section';
+  }
+}
+
+function applyCollapsedSections() {
+  document.querySelectorAll('.content > .card[data-layout-item]').forEach((card) => {
+    if (card.id === 'globalSummaryCard') {
+      setCardCollapsedUi(card, false);
+      return;
+    }
+    const explicit = Object.prototype.hasOwnProperty.call(state.collapsedSections || {}, card.id);
+    const collapsed = explicit ? Boolean(state.collapsedSections[card.id]) : defaultCardCollapsed(card.id);
+    setCardCollapsedUi(card, collapsed);
+  });
+}
+
+function initCollapsibleSections() {
+  const cards = [...document.querySelectorAll('.content > .card[data-layout-item]')];
+  cards.forEach((card) => {
+    if (!card?.id) return;
+    if (card.id === 'globalSummaryCard') {
+      card.classList.remove('section-collapsible', 'section-collapsed');
+      card.querySelector('.section-toggle-btn')?.remove();
+      return;
+    }
+    let head = card.querySelector(':scope > .section-head');
+    if (!head) {
+      const h2 = card.querySelector(':scope > h2');
+      if (h2) {
+        head = document.createElement('div');
+        head.className = 'section-head';
+        card.insertBefore(head, h2);
+        head.appendChild(h2);
+      }
+    }
+    if (!head || head.querySelector('.section-toggle-btn')) return;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'btn tiny secondary section-toggle-btn';
+    btn.addEventListener('click', () => {
+      const current = card.classList.contains('section-collapsed');
+      setCardCollapsedUi(card, !current);
+      if (state.page.mode === 'global') {
+        renderAll();
+      }
+    });
+    head.appendChild(btn);
+  });
+  applyCollapsedSections();
 }
 
 function findChartTitle(chartBox) {
@@ -594,6 +825,8 @@ function setupChartInteractions() {
     }
     if (e.target.closest('.chart-type-controls')) return;
     if (e.target.closest('.chart-resize-handle')) return;
+    if (e.target.closest('.global-vcpu-sizer-summary')) return;
+    if (e.target.closest('input, textarea, select')) return;
     if (e.target.closest('[data-close-chart-modal="1"]') || e.target.id === 'chartModalClose') {
       closeChartModal();
       return;
@@ -1146,14 +1379,47 @@ function setupSortableHeaders() {
 }
 
 function normalize(raw) {
+  const dbDisplayByDb = {};
+  (raw.properties_database || []).forEach((r) => {
+    const key = r.WHICH_DB || r.cdb;
+    const nm = r.DB_NAME || r.db_name || r.dbname;
+    if (key && nm) dbDisplayByDb[key] = String(nm);
+  });
+
+  const inferDbDisplay = (dbKey) => {
+    const key = String(dbKey || 'UNKNOWN_DB');
+    if (dbDisplayByDb[key]) return dbDisplayByDb[key];
+    let t = key;
+    if (t.startsWith('db_')) t = t.slice(3);
+    t = t.split('_')[0] || t;
+    return t || 'UNKNOWN_DB';
+  };
+  const inferInstanceDisplay = (instKey) => {
+    const rawInst = String(instKey || 'UNKNOWN_INSTANCE');
+    const m = rawInst.match(/^db_([^_$]+)/i);
+    if (m?.[1]) return m[1];
+    if (rawInst.includes('$')) {
+      const parts = rawInst.split('$');
+      if (parts.length >= 3) return `${parts[parts.length - 2]}$${parts[parts.length - 1]}`;
+      return parts.slice(1).join('$') || rawInst;
+    }
+    return rawInst;
+  };
+  const instanceDisplayByInstance = {};
+
   const instances = (raw.instances || []).map((r) => {
     const cohort = r.cdb_cohort || r.db_cohort || 'UNASSIGNED';
     const db = r.cdb || r.WHICH_DB || 'UNKNOWN_DB';
     const instance = r.db || `${db}$${r.host || 'UNKNOWN_HOST'}`;
+    const db_display = inferDbDisplay(db);
+    const instance_display = inferInstanceDisplay(instance);
+    instanceDisplayByInstance[instance] = instance_display;
     return {
       cohort,
       db,
+      db_display,
       instance,
+      instance_display,
       host: r.host || 'UNKNOWN_HOST',
       init_cpu_count: Number(r.init_cpu_count) || 0,
       logical_cpu_count: Number(r.logical_cpu_count) || 0,
@@ -1219,7 +1485,31 @@ function normalize(raw) {
     dbVersionByDb[db] = d.cdb_version || d.db_version || 'Unknown';
   });
 
-  return { instances, cohorts, dbs, cohortRollups, dbStats, topSql, segmentIo, cpuSeriesByCohort, dbVersionByDb };
+  return { instances, cohorts, dbs, cohortRollups, dbStats, topSql, segmentIo, cpuSeriesByCohort, dbVersionByDb, dbDisplayByDb, instanceDisplayByInstance };
+}
+
+function displayDbName(db) {
+  const key = String(db || 'UNKNOWN_DB');
+  const mapped = state.graph?.dbDisplayByDb?.[key];
+  if (mapped) return mapped;
+  let t = key;
+  if (t.startsWith('db_')) t = t.slice(3);
+  t = t.split('_')[0] || t;
+  return t || key;
+}
+
+function displayInstanceName(instance) {
+  const key = String(instance || 'UNKNOWN_INSTANCE');
+  const mapped = state.graph?.instanceDisplayByInstance?.[key];
+  if (mapped) return mapped;
+  const m = key.match(/^db_([^_$]+)/i);
+  if (m?.[1]) return m[1];
+  if (key.includes('$')) {
+    const parts = key.split('$');
+    if (parts.length >= 3) return `${parts[parts.length - 2]}$${parts[parts.length - 1]}`;
+    return parts.slice(1).join('$') || key;
+  }
+  return key;
 }
 
 function buildMetricCatalog(raw) {
@@ -1272,7 +1562,7 @@ function ensureValidSelection(kind) {
 }
 
 function activeSelection() {
-  return state.selection[state.activeTab];
+  return state.selection.web;
 }
 
 function selectedInstances(kind) {
@@ -1356,8 +1646,8 @@ function buildPptSlidePlan() {
         cohort,
         instance: r.instance,
         db: r.db,
-        title: `Instance: ${r.instance}`,
-        subtitle: `${r.db} on ${r.host}`,
+        title: `Instance: ${displayInstanceName(r.instance)}`,
+        subtitle: `${displayDbName(r.db)} on ${r.host}`,
       });
     });
   });
@@ -1391,11 +1681,11 @@ function renderPptStoryboard() {
   list.innerHTML = plan
     .map(
       (s, idx) =>
-        `<label class="slide-row">
-          <input type="checkbox" data-ppt-slide-id="${escAttr(s.id)}" ${state.pptSlideSelected.has(s.id) ? 'checked' : ''} />
+        `<div class="slide-row">
+          <input class="slide-check" aria-label="Include slide ${idx + 1}" type="checkbox" data-ppt-slide-id="${escAttr(s.id)}" ${state.pptSlideSelected.has(s.id) ? 'checked' : ''} />
           <span class="slide-badge">${slideBadge(s)}</span>
           <span class="slide-title">${idx + 1}. ${esc(s.title)}</span>
-        </label>`,
+        </div>`,
     )
     .join('');
   enableReportActions();
@@ -1684,7 +1974,7 @@ async function buildSlideChartImages(slideDef) {
       (id) =>
         renderCategoricalChart(
           id,
-          memRows.map((r) => ({ label: r.db, value: r.p95 || r.max || 0 })),
+          memRows.map((r) => ({ label: displayDbName(r.db), value: r.p95 || r.max || 0 })),
           { fmtKind: 'dec1', defaultType: 'bar' },
         ),
       secondaryPx.outW,
@@ -1693,7 +1983,7 @@ async function buildSlideChartImages(slideDef) {
     return { primary: img1, secondary: img2 };
   }
   if (slideDef.type === 'instance') {
-    const series = buildInstanceCpuTimeSeries('ppt', slideDef.cohort).filter((s) => s.name === slideDef.instance);
+    const series = buildInstanceCpuTimeSeries('ppt', slideDef.cohort).filter((s) => s.key === slideDef.instance);
     const img1 = await renderTempChartPng(
       'cpuLinePptTmpInst',
       (id) => renderMultiLineChart(id, series, cpuFixedMax()),
@@ -1707,7 +1997,7 @@ async function buildSlideChartImages(slideDef) {
       (id) =>
         renderCategoricalChart(
           id,
-          memRows.map((r) => ({ label: r.db, value: r.p95 || r.max || 0 })),
+          memRows.map((r) => ({ label: displayDbName(r.db), value: r.p95 || r.max || 0 })),
           { fmtKind: 'dec1', defaultType: 'bar' },
         ),
       secondaryPx.outW,
@@ -1864,12 +2154,12 @@ function addNativeChartsForSlide(slide, pptx, slideDef) {
       });
       const memRows = aggregateMetricByDb('ppt', 'DB Memory (MB)', (v) => v / 1024, slideDef.cohort)
         .sort((a, b) => (b.p95 || b.max || 0) - (a.p95 || a.max || 0))
-        .map((r) => ({ label: r.db, value: r.p95 || r.max || 0 }));
+        .map((r) => ({ label: displayDbName(r.db), value: r.p95 || r.max || 0 }));
       out.secondary = addNativeBarChart(slide, pptx, PPT_LAYOUT_MAP.chartSecondary, memRows, 'P95 Memory (GB)');
       return out;
     }
     if (slideDef.type === 'instance') {
-      const cpuSeries = buildInstanceCpuTimeSeries('ppt', slideDef.cohort).filter((s) => s.name === slideDef.instance);
+      const cpuSeries = buildInstanceCpuTimeSeries('ppt', slideDef.cohort).filter((s) => s.key === slideDef.instance);
       out.primary = addNativeLineChart(slide, pptx, PPT_LAYOUT_MAP.chartPrimary, cpuSeries, {
         fixedMax: cpuFixedMax(),
       });
@@ -1941,7 +2231,9 @@ async function exportPptFromStoryboard() {
       if (previewStatus) previewStatus.textContent = `Generating slide ${pageNo}/${selectedIds.length}: ${def.title}`;
 
       if (def.type === 'title') {
-        addPptHeader(slide, 'AWR Analysis', `Generated on ${new Date().toLocaleString()}`, pageNo, totalSlides);
+        const customer = String(state.reportMeta?.customerName || '').trim();
+        const subtitle = customer ? `AWR Analysis for: ${customer}` : 'AWR Analysis';
+        addPptHeader(slide, 'AWR Analysis', subtitle, pageNo, totalSlides);
         slide.addShape('roundRect', {
           x: PPT_LAYOUT_MAP.coverBox.x,
           y: PPT_LAYOUT_MAP.coverBox.y,
@@ -1951,11 +2243,20 @@ async function exportPptFromStoryboard() {
           line: { color: PPT_STYLE.border, pt: 1 },
           fill: { color: PPT_STYLE.panel },
         });
-        slide.addText('Executive report with global, cohort and instance drill downs.', {
-          x: 1.1, y: 2.55, w: 11.2, h: 0.6, fontSize: 18, color: PPT_STYLE.text, align: 'center', fontFace: PPT_STYLE.font,
-        });
-        slide.addText('Global -> Cohort -> Instance', {
-          x: 1.1, y: 3.2, w: 11.2, h: 0.4, fontSize: 13, color: PPT_STYLE.muted, align: 'center', fontFace: PPT_STYLE.font,
+        const roleLines = [
+          ['Sales Rep', String(state.reportMeta?.salesRepName || '').trim()],
+          ['Architect', String(state.reportMeta?.architectName || '').trim()],
+          ['Engineer', String(state.reportMeta?.engineerName || '').trim()],
+        ]
+          .filter(([, value]) => value)
+          .map(([role, value]) => `${role}: ${value}`);
+        if (roleLines.length) {
+          slide.addText(roleLines.join('\n'), {
+            x: 0.866, y: 5.339, w: 6.22, h: 1.26, fontSize: 16, color: PPT_STYLE.text, align: 'left', fontFace: PPT_STYLE.font,
+          });
+        }
+        slide.addText(`Generated on ${new Date().toLocaleString()}`, {
+          x: 0.866, y: 7.087, w: 4.13, h: 0.31, fontSize: 12, color: PPT_STYLE.muted, align: 'left', fontFace: PPT_STYLE.font,
         });
         continue;
       }
@@ -2017,7 +2318,7 @@ async function exportPptFromStoryboard() {
             { text: 'Database', options: { bold: true } },
             { text: 'Instances', options: { bold: true } },
           ],
-          ...dbRows.map((r) => [shortLabel(r.db, 34), String(r.n)]),
+          ...dbRows.map((r) => [shortLabel(displayDbName(r.db), 34), String(r.n)]),
         ],
         { x: 0.5, y: PPT_LAYOUT_MAP.tableY, w: 12.3, h: PPT_LAYOUT_MAP.tableH, fontSize: 9, border: { pt: 1, color: PPT_STYLE.border }, color: PPT_STYLE.text },
       );
@@ -2032,10 +2333,10 @@ async function exportPptFromStoryboard() {
 
     if (def.type === 'instance') {
       const row = pptRows.find((r) => r.cohort === def.cohort && r.instance === def.instance);
-      addPptHeader(slide, `Instance: ${def.instance}`, `${def.cohort} | ${def.db}`, pageNo, totalSlides);
+      addPptHeader(slide, `Instance: ${displayInstanceName(def.instance)}`, `${def.cohort} | ${displayDbName(def.db)}`, pageNo, totalSlides);
       addPptKpiGrid(slide, [
         { label: 'Cohort', value: def.cohort || 'N/A' },
-        { label: 'Database', value: row?.db || def.db || 'N/A' },
+        { label: 'Database', value: displayDbName(row?.db || def.db || 'N/A') },
         { label: 'Host', value: row?.host || 'N/A' },
         { label: 'vCPU', value: fmt(row?.init_cpu_count || row?.logical_cpu_count || 0, 'dec1') },
         { label: 'Memory (GB)', value: fmt(row?.mem_gb || 0, 'dec1') },
@@ -2397,21 +2698,32 @@ function renderSelectors() {
   const g = state.graph;
   const sel = activeSelection();
 
-  const cohortSelect = $('cohortSelect');
-  cohortSelect.innerHTML = g.cohorts
-    .map((c) => `<option value="${esc(c)}" ${sel.cohorts.has(c) ? 'selected' : ''}>${esc(c)}</option>`)
+  $('cohortSelect').innerHTML = g.cohorts
+    .map(
+      (c) => `<label class="scope-item"><input type="checkbox" data-scope-kind="cohort" value="${escAttr(c)}" ${
+        sel.cohorts.has(c) ? 'checked' : ''
+      } /><span title="${escAttr(c)}">${esc(c)}</span></label>`,
+    )
     .join('');
 
   const dbOptions = [...new Set(g.instances.filter((x) => sel.cohorts.has(x.cohort)).map((x) => x.db))].sort();
   $('dbSelect').innerHTML = dbOptions
-    .map((d) => `<option value="${esc(d)}" ${sel.dbs.has(d) ? 'selected' : ''}>${esc(d)}</option>`)
+    .map(
+      (d) => `<label class="scope-item"><input type="checkbox" data-scope-kind="db" value="${escAttr(d)}" ${
+        sel.dbs.has(d) ? 'checked' : ''
+      } /><span title="${escAttr(displayDbName(d))}">${esc(displayDbName(d))}</span></label>`,
+    )
     .join('');
 
   const instanceOptions = [
     ...new Set(g.instances.filter((x) => sel.cohorts.has(x.cohort) && sel.dbs.has(x.db)).map((x) => x.instance)),
   ].sort();
   $('instanceSelect').innerHTML = instanceOptions
-    .map((i) => `<option value="${esc(i)}" ${sel.instances.has(i) ? 'selected' : ''}>${esc(i)}</option>`)
+    .map(
+      (i) => `<label class="scope-item"><input type="checkbox" data-scope-kind="instance" value="${escAttr(i)}" ${
+        sel.instances.has(i) ? 'checked' : ''
+      } /><span title="${escAttr(displayInstanceName(i))}">${esc(displayInstanceName(i))}</span></label>`,
+    )
     .join('');
 
   $('metricsList').innerHTML = metricGroupsForRender(sel)
@@ -2806,6 +3118,458 @@ function renderCpuMemorySections(kind) {
   renderBoxPlotByGroup('memBoxChart', memRows, 'dec1', 'cohort');
 }
 
+function clampPct(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return 0;
+  return Math.max(0, Math.min(100, n));
+}
+
+function clampTargetPct(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return 0;
+  return Math.max(0, Math.min(200, n));
+}
+
+function computeGlobalInstanceCpuStats(kind) {
+  const sel = state.selection[kind];
+  const series = [...sel.cohorts].flatMap((cohort) => buildInstanceCpuTimeSeries(kind, cohort));
+  const vals = series
+    .flatMap((s) => s.y || [])
+    .map((v) => Number(v))
+    .filter((v) => Number.isFinite(v));
+  if (!vals.length) return null;
+  const sorted = [...vals].sort((a, b) => a - b);
+  return {
+    count: sorted.length,
+    min: quantileFromSorted(sorted, 0),
+    p30: quantileFromSorted(sorted, 0.3),
+    p50: quantileFromSorted(sorted, 0.5),
+    p70: quantileFromSorted(sorted, 0.7),
+    p95: quantileFromSorted(sorted, 0.95),
+    p99: quantileFromSorted(sorted, 0.99),
+    max: quantileFromSorted(sorted, 1),
+  };
+}
+
+function computeGlobalInstanceMemoryStats(kind) {
+  const rows = selectedInstances(kind);
+  const vals = rows
+    .map((r) => {
+      const total = Number(r.mem_gb) || 0;
+      const used = (Number(r.sga_size_gb) || 0) + (Number(r.pga_size_gb) || 0);
+      if (total <= 0) return null;
+      return (used / total) * 100;
+    })
+    .filter((v) => Number.isFinite(v));
+  if (!vals.length) return null;
+  const sorted = [...vals].sort((a, b) => a - b);
+  return {
+    count: sorted.length,
+    min: quantileFromSorted(sorted, 0),
+    p30: quantileFromSorted(sorted, 0.3),
+    p50: quantileFromSorted(sorted, 0.5),
+    p70: quantileFromSorted(sorted, 0.7),
+    p95: quantileFromSorted(sorted, 0.95),
+    p99: quantileFromSorted(sorted, 0.99),
+    max: quantileFromSorted(sorted, 1),
+  };
+}
+
+function computeGlobalIopsStats(kind) {
+  const sel = state.selection[kind];
+  const rows = (state.graph?.dbStats || []).filter(
+    (r) =>
+      sel.cohorts.has(r.cohort) &&
+      sel.dbs.has(r.db) &&
+      r.metric === 'DB IOPS' &&
+      (!r.summary_of || r.summary_of === 'cdb'),
+  );
+  if (!rows.length) return null;
+  const cap = Math.max(
+    ...rows.map((r) => Math.max(Number(r.max) || 0, Number(r.p99) || 0, Number(r.p95) || 0)),
+    0,
+  );
+  if (!Number.isFinite(cap) || cap <= 0) return null;
+  const values = rows
+    .flatMap((r) => [r.min, r.p30, r.p50, r.p70, r.p95, r.p99, r.max])
+    .map((v) => ((Number(v) || 0) / cap) * 100)
+    .filter((v) => Number.isFinite(v));
+  if (!values.length) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  return {
+    count: sorted.length,
+    min: quantileFromSorted(sorted, 0),
+    p30: quantileFromSorted(sorted, 0.3),
+    p50: quantileFromSorted(sorted, 0.5),
+    p70: quantileFromSorted(sorted, 0.7),
+    p95: quantileFromSorted(sorted, 0.95),
+    p99: quantileFromSorted(sorted, 0.99),
+    max: quantileFromSorted(sorted, 1),
+  };
+}
+
+function computeGlobalStorageStats(kind) {
+  const rows = computeByCohort(kind);
+  const values = rows
+    .map((r) => {
+      const allocated = Number(r.allocated) || 0;
+      const used = Number(r.used) || 0;
+      if (allocated <= 0) return null;
+      return (used / allocated) * 100;
+    })
+    .filter((v) => Number.isFinite(v));
+  if (!values.length) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  return {
+    count: sorted.length,
+    min: quantileFromSorted(sorted, 0),
+    p30: quantileFromSorted(sorted, 0.3),
+    p50: quantileFromSorted(sorted, 0.5),
+    p70: quantileFromSorted(sorted, 0.7),
+    p95: quantileFromSorted(sorted, 0.95),
+    p99: quantileFromSorted(sorted, 0.99),
+    max: quantileFromSorted(sorted, 1),
+  };
+}
+
+function renderVerticalSizerChart(chartNode, stats, selectedPct, titleText, colorMain) {
+  const w = 340;
+  const h = 420;
+  const left = 44;
+  const right = 126;
+  const top = 18;
+  const bottom = 28;
+  const plotW = w - left - right;
+  const plotH = h - top - bottom;
+  const xMid = left + plotW * 0.46;
+  const boxHalf = Math.max(16, plotW * 0.24);
+  const y = (pct) => top + ((100 - clampPct(pct)) / 100) * plotH;
+  const labelX = xMid + boxHalf + 22;
+
+  const p = {
+    min: clampPct(stats.min),
+    p30: clampPct(stats.p30),
+    p50: clampPct(stats.p50),
+    p70: clampPct(stats.p70),
+    p95: clampPct(stats.p95),
+    p99: clampPct(stats.p99),
+    max: clampPct(stats.max),
+  };
+
+  const yMin = y(p.min);
+  const yQ1 = y(p.p30);
+  const yMed = y(p.p50);
+  const yQ3 = y(p.p70);
+  const yMax = y(p.max);
+  const yP95 = y(p.p95);
+  const yP99 = y(p.p99);
+  const ySelected = y(clampPct(selectedPct));
+  const hasUpperOutlier = p.max > p.p99 + 0.0001;
+  const yUpperWhisker = hasUpperOutlier ? yP99 : yMax;
+  const outlierDiamond =
+    hasUpperOutlier
+      ? `<polygon points="${xMid},${yMax - 5} ${xMid + 5},${yMax} ${xMid},${yMax + 5} ${xMid - 5},${yMax}" fill="#7c3aed" stroke="#ffffff" stroke-width="0.8"></polygon>`
+      : '';
+
+  const ticks = [];
+  for (let v = 0; v <= 100; v += 10) {
+    const yy = y(v);
+    ticks.push(
+      `<line x1="${left - 5}" y1="${yy}" x2="${left + plotW}" y2="${yy}" stroke="${v % 20 === 0 ? '#e2e8f0' : '#edf2f7'}" />` +
+        `<text x="${left - 10}" y="${yy + 3}" text-anchor="end" font-size="9" fill="#64748b">${v}%</text>`,
+    );
+  }
+
+  const marker = (name, val, yy, color = '#334155') =>
+    `<line x1="${xMid + boxHalf}" y1="${yy}" x2="${labelX - 6}" y2="${yy}" stroke="${color}" stroke-width="1" />` +
+    `<circle cx="${labelX - 8}" cy="${yy}" r="2.1" fill="${color}" />` +
+    `<text x="${labelX}" y="${yy + 3}" font-size="9" fill="#334155">${name} ${fmt(val, 'dec1')}%</text>`;
+
+  chartNode.innerHTML = `
+    <svg viewBox="0 0 ${w} ${h}" role="img" aria-label="${escAttr(titleText)}">
+      ${ticks.join('')}
+      <text x="${left + plotW / 2}" y="${h - 6}" text-anchor="middle" font-size="10" fill="#64748b">${esc(titleText)}</text>
+      <line x1="${xMid}" y1="${yUpperWhisker}" x2="${xMid}" y2="${yMin}" stroke="#64748b" stroke-width="1.5"></line>
+      <rect x="${xMid - boxHalf}" y="${Math.min(yQ3, yQ1)}" width="${boxHalf * 2}" height="${Math.max(2, Math.abs(yQ1 - yQ3))}" fill="${colorMain}22" stroke="${colorMain}" stroke-width="1.2"></rect>
+      <line x1="${xMid - boxHalf}" y1="${yMed}" x2="${xMid + boxHalf}" y2="${yMed}" stroke="${colorMain}" stroke-width="2"></line>
+      <line x1="${xMid - 10}" y1="${yMin}" x2="${xMid + 10}" y2="${yMin}" stroke="#64748b" stroke-width="1.2"></line>
+      <line x1="${xMid - 10}" y1="${yUpperWhisker}" x2="${xMid + 10}" y2="${yUpperWhisker}" stroke="#64748b" stroke-width="1.2"></line>
+      ${outlierDiamond}
+      <line class="sizer-target-line" x1="${left}" y1="${ySelected}" x2="${left + plotW}" y2="${ySelected}" stroke="#b11f1f" stroke-width="2" stroke-dasharray="5 3"></line>
+      <text class="sizer-target-label" x="${left + plotW + 6}" y="${Math.max(12, ySelected - 4)}" font-size="9" fill="#b11f1f">${fmt(clampTargetPct(
+        selectedPct,
+      ), 'dec1')}%</text>
+      ${marker('P30', p.p30, yQ1)}
+      ${marker('P50', p.p50, yMed)}
+      ${marker('P70', p.p70, yQ3)}
+      ${marker('P95', p.p95, yP95, '#b45309')}
+      ${marker('P99', p.p99, yP99, '#7c3aed')}
+      ${hasUpperOutlier ? marker('MAX(outlier)', p.max, yMax, '#7c3aed') : ''}
+    </svg>
+  `;
+
+  return { y, p, targetLine: chartNode.querySelector('.sizer-target-line'), targetLabel: chartNode.querySelector('.sizer-target-label') };
+}
+
+function renderGlobalVcpuSizer(kind) {
+  const chartNode = $('globalVcpuSizerChart');
+  const memChartNode = $('globalMemSizerChart');
+  const iopsChartNode = $('globalIopsSizerChart');
+  const storageChartNode = $('globalStorageSizerChart');
+  const controlsNode = $('globalSizerControls');
+  if (!chartNode || !memChartNode || !iopsChartNode || !storageChartNode || !controlsNode) return;
+
+  const stats = computeGlobalInstanceCpuStats(kind);
+  const memStats = computeGlobalInstanceMemoryStats(kind);
+  const iopsStats = computeGlobalIopsStats(kind);
+  const storageStats = computeGlobalStorageStats(kind);
+  const globalTotals = computeGlobal(kind);
+  const metricCfg = {
+    vcpu: { total: Number(globalTotals?.vcpu_total) || 0, unit: 'vCPU', fmt: 'dec1' },
+    memory: { total: Number(globalTotals?.memory_gb_total) || 0, unit: 'GB', fmt: 'dec1' },
+    iops: { total: Number(globalTotals?.db_iops_total) || 0, unit: 'IOPS', fmt: 'dec1' },
+    storage: { total: Number(globalTotals?.allocated_storage_gb) || 0, unit: 'GB', fmt: 'dec1' },
+  };
+  if (!stats && !memStats && !iopsStats && !storageStats) {
+    chartNode.innerHTML = '<p class="muted">No CPU series available in the current scope.</p>';
+    memChartNode.innerHTML = '<p class="muted">No memory utilization series available in the current scope.</p>';
+    iopsChartNode.innerHTML = '<p class="muted">No IOPS utilization series available in the current scope.</p>';
+    storageChartNode.innerHTML = '<p class="muted">No storage utilization series available in the current scope.</p>';
+    controlsNode.innerHTML = '';
+    return;
+  }
+
+  if (stats && !Number.isFinite(Number(state.vcpuSizingTargetPct))) {
+    state.vcpuSizingTargetPct = clampTargetPct(stats.p95 * 1.2);
+  }
+  if (memStats && !Number.isFinite(Number(state.memorySizingTargetPct))) {
+    state.memorySizingTargetPct = clampTargetPct(memStats.p95 * 1.2);
+  }
+  if (iopsStats && !Number.isFinite(Number(state.iopsSizingTargetPct))) {
+    state.iopsSizingTargetPct = clampTargetPct(iopsStats.p95 * 1.2);
+  }
+  if (storageStats && !Number.isFinite(Number(state.storageSizingTargetPct))) {
+    state.storageSizingTargetPct = clampTargetPct(storageStats.p95 * 1.2);
+  }
+
+  const vcpuModel = stats
+    ? renderVerticalSizerChart(chartNode, stats, state.vcpuSizingTargetPct, 'VCPU Utilization', '#0f766e')
+    : null;
+  const memModel = memStats
+    ? renderVerticalSizerChart(memChartNode, memStats, state.memorySizingTargetPct, 'Memory Utilization', '#0e7490')
+    : null;
+  if (!iopsStats) iopsChartNode.innerHTML = '<p class="muted">No IOPS utilization data in current scope.</p>';
+  const iopsModel = iopsStats
+    ? renderVerticalSizerChart(iopsChartNode, iopsStats, state.iopsSizingTargetPct, 'IOPS Utilization', '#6d28d9')
+    : null;
+  if (!storageStats) storageChartNode.innerHTML = '<p class="muted">No storage utilization data in current scope.</p>';
+  const storageModel = storageStats
+    ? renderVerticalSizerChart(storageChartNode, storageStats, state.storageSizingTargetPct, 'Storage Utilization', '#b45309')
+    : null;
+
+  controlsNode.innerHTML = `
+    <div class="global-sizer-controls-grid">
+      <div class="global-sizer-control-card">
+        <label for="globalVcpuTargetInput" style="margin:0 0 4px;color:#475569;font-size:12px;">VCPU target input (0-200%)</label>
+        <input id="globalVcpuTargetInput" type="number" min="0" max="200" step="0.1" value="${fmt(clampTargetPct(state.vcpuSizingTargetPct), 'dec1')}" style="width:100%;padding:6px 8px;border:1px solid #cfd6df;border-radius:8px;" />
+        <div id="globalVcpuInputError" style="min-height:16px;color:#b91c1c;font-size:11px;margin-top:4px;"></div>
+        <div id="globalVcpuSummary" class="line" style="font-size:11px;color:#475569;"></div>
+        <div id="globalVcpuQuant" class="line" style="font-size:11px;color:#334155;"></div>
+      </div>
+      <div class="global-sizer-control-card">
+        <label for="globalMemTargetInput" style="margin:0 0 4px;color:#475569;font-size:12px;">Memory target input (0-200%)</label>
+        <input id="globalMemTargetInput" type="number" min="0" max="200" step="0.1" value="${fmt(clampTargetPct(state.memorySizingTargetPct), 'dec1')}" style="width:100%;padding:6px 8px;border:1px solid #cfd6df;border-radius:8px;" />
+        <div id="globalMemInputError" style="min-height:16px;color:#b91c1c;font-size:11px;margin-top:4px;"></div>
+        <div id="globalMemSummary" class="line" style="font-size:11px;color:#475569;"></div>
+        <div id="globalMemQuant" class="line" style="font-size:11px;color:#334155;"></div>
+      </div>
+      <div class="global-sizer-control-card">
+        <label for="globalIopsTargetInput" style="margin:0 0 4px;color:#475569;font-size:12px;">IOPS target input (0-200%)</label>
+        <input id="globalIopsTargetInput" type="number" min="0" max="200" step="0.1" value="${fmt(clampTargetPct(state.iopsSizingTargetPct), 'dec1')}" style="width:100%;padding:6px 8px;border:1px solid #cfd6df;border-radius:8px;" />
+        <div id="globalIopsInputError" style="min-height:16px;color:#b91c1c;font-size:11px;margin-top:4px;"></div>
+        <div id="globalIopsSummary" class="line" style="font-size:11px;color:#475569;"></div>
+        <div id="globalIopsQuant" class="line" style="font-size:11px;color:#334155;"></div>
+      </div>
+      <div class="global-sizer-control-card">
+        <label for="globalStorageTargetInput" style="margin:0 0 4px;color:#475569;font-size:12px;">Storage target input (0-200%)</label>
+        <input id="globalStorageTargetInput" type="number" min="0" max="200" step="0.1" value="${fmt(clampTargetPct(state.storageSizingTargetPct), 'dec1')}" style="width:100%;padding:6px 8px;border:1px solid #cfd6df;border-radius:8px;" />
+        <div id="globalStorageInputError" style="min-height:16px;color:#b91c1c;font-size:11px;margin-top:4px;"></div>
+        <div id="globalStorageSummary" class="line" style="font-size:11px;color:#475569;"></div>
+        <div id="globalStorageQuant" class="line" style="font-size:11px;color:#334155;"></div>
+      </div>
+    </div>
+  `;
+  const vcpuErrNode = controlsNode.querySelector('#globalVcpuInputError');
+  const memErrNode = controlsNode.querySelector('#globalMemInputError');
+  const iopsErrNode = controlsNode.querySelector('#globalIopsInputError');
+  const storageErrNode = controlsNode.querySelector('#globalStorageInputError');
+  const vcpuInput = controlsNode.querySelector('#globalVcpuTargetInput');
+  const memInput = controlsNode.querySelector('#globalMemTargetInput');
+  const iopsInput = controlsNode.querySelector('#globalIopsTargetInput');
+  const storageInput = controlsNode.querySelector('#globalStorageTargetInput');
+  const vcpuSummary = controlsNode.querySelector('#globalVcpuSummary');
+  const memSummary = controlsNode.querySelector('#globalMemSummary');
+  const iopsSummary = controlsNode.querySelector('#globalIopsSummary');
+  const storageSummary = controlsNode.querySelector('#globalStorageSummary');
+  const vcpuQuant = controlsNode.querySelector('#globalVcpuQuant');
+  const memQuant = controlsNode.querySelector('#globalMemQuant');
+  const iopsQuant = controlsNode.querySelector('#globalIopsQuant');
+  const storageQuant = controlsNode.querySelector('#globalStorageQuant');
+
+  const validateInput = (raw) => {
+    if (raw == null || String(raw).trim() === '') return { ok: false, msg: 'Enter a value between 0 and 200.' };
+    const n = Number(raw);
+    if (!Number.isFinite(n)) return { ok: false, msg: 'Invalid number.' };
+    if (n < 0) return { ok: false, msg: 'Minimum is 0.' };
+    if (n > 200) return { ok: false, msg: 'Max is 200.' };
+    return { ok: true, value: n };
+  };
+
+  const updateOneUi = (which) => {
+    const modelByType = { vcpu: vcpuModel, memory: memModel, iops: iopsModel, storage: storageModel };
+    const statsByType = { vcpu: stats, memory: memStats, iops: iopsStats, storage: storageStats };
+    const summaryByType = { vcpu: vcpuSummary, memory: memSummary, iops: iopsSummary, storage: storageSummary };
+    const quantByType = { vcpu: vcpuQuant, memory: memQuant, iops: iopsQuant, storage: storageQuant };
+    const selectedByType = {
+      vcpu: state.vcpuSizingTargetPct,
+      memory: state.memorySizingTargetPct,
+      iops: state.iopsSizingTargetPct,
+      storage: state.storageSizingTargetPct,
+    };
+    const selected = clampTargetPct(selectedByType[which]);
+    const model = modelByType[which];
+    const baseline = statsByType[which];
+    const summaryNode = summaryByType[which];
+    const quantNode = quantByType[which];
+    const cfg = metricCfg[which];
+    if (!model || !baseline) return;
+    const p95v = clampPct(baseline.p95);
+    const relPct = p95v > 0 ? ((selected - p95v) / p95v) * 100 : 0;
+    const yy = model.y(clampPct(selected));
+    if (model.targetLine) {
+      model.targetLine.setAttribute('y1', String(yy));
+      model.targetLine.setAttribute('y2', String(yy));
+    }
+    if (model.targetLabel) {
+      model.targetLabel.setAttribute('y', String(Math.max(12, yy - 4)));
+      model.targetLabel.textContent = `${fmt(selected, 'dec1')}%${selected > 100 ? ' (off-scale)' : ''}`;
+    }
+    if (summaryNode) {
+      summaryNode.textContent = `P95 ${fmt(p95v, 'dec1')}% | Target ${fmt(selected, 'dec1')}% | Δ ${fmt(selected - p95v, 'dec1')} pts (${fmt(relPct, 'dec1')}%)`;
+    }
+    if (quantNode && cfg) {
+      const maxQty = cfg.total;
+      const targetQty = (maxQty * selected) / 100;
+      quantNode.textContent = `100% = ${fmt(maxQty, cfg.fmt)} ${cfg.unit} | ${fmt(selected, 'dec1')}% = ${fmt(targetQty, cfg.fmt)} ${cfg.unit}`;
+    }
+  };
+
+  if (vcpuInput) {
+    vcpuInput.addEventListener('input', () => {
+      const v = validateInput(vcpuInput.value);
+      if (!v.ok) {
+        if (vcpuErrNode) vcpuErrNode.textContent = v.msg;
+        return;
+      }
+      if (vcpuErrNode) vcpuErrNode.textContent = '';
+      state.vcpuSizingTargetPct = v.value;
+      updateOneUi('vcpu');
+    });
+    vcpuInput.addEventListener('blur', () => {
+      const v = validateInput(vcpuInput.value);
+      if (!v.ok) {
+        vcpuInput.value = String(fmt(clampTargetPct(state.vcpuSizingTargetPct), 'dec1'));
+        if (vcpuErrNode) vcpuErrNode.textContent = '';
+        return;
+      }
+      state.vcpuSizingTargetPct = clampTargetPct(v.value);
+      vcpuInput.value = String(fmt(clampTargetPct(state.vcpuSizingTargetPct), 'dec1'));
+      if (vcpuErrNode) vcpuErrNode.textContent = '';
+      updateOneUi('vcpu');
+    });
+  }
+
+  if (memInput) {
+    memInput.addEventListener('input', () => {
+      const v = validateInput(memInput.value);
+      if (!v.ok) {
+        if (memErrNode) memErrNode.textContent = v.msg;
+        return;
+      }
+      if (memErrNode) memErrNode.textContent = '';
+      state.memorySizingTargetPct = v.value;
+      updateOneUi('memory');
+    });
+    memInput.addEventListener('blur', () => {
+      const v = validateInput(memInput.value);
+      if (!v.ok) {
+        memInput.value = String(fmt(clampTargetPct(state.memorySizingTargetPct), 'dec1'));
+        if (memErrNode) memErrNode.textContent = '';
+        return;
+      }
+      state.memorySizingTargetPct = clampTargetPct(v.value);
+      memInput.value = String(fmt(clampTargetPct(state.memorySizingTargetPct), 'dec1'));
+      if (memErrNode) memErrNode.textContent = '';
+      updateOneUi('memory');
+    });
+  }
+
+  if (iopsInput) {
+    iopsInput.addEventListener('input', () => {
+      const v = validateInput(iopsInput.value);
+      if (!v.ok) {
+        if (iopsErrNode) iopsErrNode.textContent = v.msg;
+        return;
+      }
+      if (iopsErrNode) iopsErrNode.textContent = '';
+      state.iopsSizingTargetPct = v.value;
+      updateOneUi('iops');
+    });
+    iopsInput.addEventListener('blur', () => {
+      const v = validateInput(iopsInput.value);
+      if (!v.ok) {
+        iopsInput.value = String(fmt(clampTargetPct(state.iopsSizingTargetPct), 'dec1'));
+        if (iopsErrNode) iopsErrNode.textContent = '';
+        return;
+      }
+      state.iopsSizingTargetPct = clampTargetPct(v.value);
+      iopsInput.value = String(fmt(clampTargetPct(state.iopsSizingTargetPct), 'dec1'));
+      if (iopsErrNode) iopsErrNode.textContent = '';
+      updateOneUi('iops');
+    });
+  }
+
+  if (storageInput) {
+    storageInput.addEventListener('input', () => {
+      const v = validateInput(storageInput.value);
+      if (!v.ok) {
+        if (storageErrNode) storageErrNode.textContent = v.msg;
+        return;
+      }
+      if (storageErrNode) storageErrNode.textContent = '';
+      state.storageSizingTargetPct = v.value;
+      updateOneUi('storage');
+    });
+    storageInput.addEventListener('blur', () => {
+      const v = validateInput(storageInput.value);
+      if (!v.ok) {
+        storageInput.value = String(fmt(clampTargetPct(state.storageSizingTargetPct), 'dec1'));
+        if (storageErrNode) storageErrNode.textContent = '';
+        return;
+      }
+      state.storageSizingTargetPct = clampTargetPct(v.value);
+      storageInput.value = String(fmt(clampTargetPct(state.storageSizingTargetPct), 'dec1'));
+      if (storageErrNode) storageErrNode.textContent = '';
+      updateOneUi('storage');
+    });
+  }
+
+  updateOneUi('vcpu');
+  updateOneUi('memory');
+  updateOneUi('iops');
+  updateOneUi('storage');
+}
+
 function renderMultiLineChart(containerId, seriesRaw, fixedMax = null) {
   const container = $(containerId);
   if (!container) return;
@@ -2956,7 +3720,8 @@ function buildInstanceCpuTimeSeries(kind, cohort) {
   return rows.map((r) => {
     const share = total > 0 ? (r.init_cpu_count || 0) / total : fallbackShare;
     return {
-      name: r.instance,
+      key: r.instance,
+      name: displayInstanceName(r.instance),
       x: base.x,
       y: base.y.map((v) => v * share),
     };
@@ -3004,6 +3769,7 @@ function renderGlobal() {
   $('kpiGrid').innerHTML = kpiMetrics
     .map((m) => `<div class="kpi"><div class="name">${esc(m.label)}</div><div class="value">${fmt(summary[m.id], m.fmt)}</div></div>`)
     .join('');
+  renderGlobalVcpuSizer(kind);
 
   renderCohortTable(cohortRows);
   renderCohortMetricCharts(cohortRows);
@@ -3053,7 +3819,7 @@ function previewDetailForSlide(slide, rows, byCohort) {
   }
   if (slide.type === 'instance') {
     const row = rows.find((r) => r.cohort === slide.cohort && r.instance === slide.instance);
-    detail = `${row?.db || slide.db || ''} | ${row?.host || 'Host N/A'}`;
+    detail = `${displayDbName(row?.db || slide.db || '')} | ${row?.host || 'Host N/A'}`;
   }
   return detail;
 }
@@ -3085,7 +3851,7 @@ function previewKpisForSlide(slide, rows, byCohort) {
   if (slide.type === 'instance') {
     const row = rows.find((r) => r.cohort === slide.cohort && r.instance === slide.instance);
     return [
-      { k: 'DB', v: row?.db || slide.db || 'N/A' },
+      { k: 'DB', v: displayDbName(row?.db || slide.db || 'N/A') },
       { k: 'Host', v: row?.host || 'N/A' },
       { k: 'vCPU', v: fmt(row?.init_cpu_count || row?.logical_cpu_count || 0, 'dec1') },
       { k: 'Memory', v: fmt(row?.mem_gb || 0, 'dec1') },
@@ -3112,7 +3878,7 @@ function previewRowsForSlide(slide, rows, byCohort) {
     return [...byDb.entries()]
       .sort((a, b) => b[1] - a[1])
       .slice(0, 5)
-      .map(([db, n]) => [db, String(n)]);
+      .map(([db, n]) => [displayDbName(db), String(n)]);
   }
   if (slide.type === 'instance') {
     const db = rows.find((r) => r.cohort === slide.cohort && r.instance === slide.instance)?.db || slide.db;
@@ -3366,8 +4132,8 @@ function renderCohortPage(kind) {
             .sort((a, b) => a.instance.localeCompare(b.instance))
             .map(
               (r) =>
-                `<tr class="clickable" data-page-instance-key="${encodeKey(r.instance)}"><td>${esc(r.instance)}</td><td>${esc(
-                  shortLabel(r.db, 36),
+                `<tr class="clickable" data-page-instance-key="${encodeKey(r.instance)}"><td>${esc(displayInstanceName(r.instance))}</td><td>${esc(
+                  shortLabel(displayDbName(r.db), 36),
                 )}</td><td>${esc(r.host)}</td><td>${fmt(r.init_cpu_count, 'dec1')}</td><td>${fmt(r.mem_gb, 'dec1')}</td><td>${fmt(
                   r.sga_size_gb,
                   'dec1',
@@ -3409,11 +4175,11 @@ function renderInstancePage(kind) {
     .sort((a, b) => b.elapsed - a.elapsed)
     .slice(0, 12);
 
-  $('instancePageTitle').textContent = `Instance: ${state.page.instance}`;
+  $('instancePageTitle').textContent = `Instance: ${displayInstanceName(state.page.instance)}`;
   $('instancePageBody').innerHTML = `
     <div class="kpi-grid">
       <div class="kpi"><div class="name">Cohort</div><div class="value" style="font-size:16px;">${esc(item?.cohort || '')}</div></div>
-      <div class="kpi"><div class="name">Database</div><div class="value" style="font-size:16px;">${esc(shortLabel(db, 26))}</div></div>
+      <div class="kpi"><div class="name">Database</div><div class="value" style="font-size:16px;">${esc(shortLabel(displayDbName(db), 26))}</div></div>
       <div class="kpi"><div class="name">Host</div><div class="value" style="font-size:16px;">${esc(item?.host || '')}</div></div>
       <div class="kpi"><div class="name">vCPU</div><div class="value">${fmt(item?.init_cpu_count || 0, 'dec1')}</div></div>
       <div class="kpi"><div class="name">Memory (GB)</div><div class="value">${fmt(item?.mem_gb || 0, 'dec1')}</div></div>
@@ -3473,7 +4239,7 @@ function renderInstancePage(kind) {
     </div>
   `;
 
-  const instanceSeries = buildInstanceCpuTimeSeries(kind, state.page.cohort).filter((s) => s.name === state.page.instance);
+  const instanceSeries = buildInstanceCpuTimeSeries(kind, state.page.cohort).filter((s) => s.key === state.page.instance);
   const cpuMax = cpuFixedMax();
   renderMultiLineChart('cpuLineInstancePage', instanceSeries, cpuMax);
 
@@ -3500,6 +4266,7 @@ function renderPageMode() {
 
   if (state.page.mode === 'global') {
     globalCards.forEach((c) => (c.style.display = ''));
+    applyCollapsedSections();
     cohortPage.style.display = 'none';
     instancePage.style.display = 'none';
     if (pptPreviewPage) pptPreviewPage.style.display = 'none';
@@ -3528,7 +4295,7 @@ function renderPageMode() {
   } else {
     nav.innerHTML = `<span class="page-link" id="navGlobal">Global</span> / <span class="page-link" id="navCohort">${esc(
       state.page.cohort,
-    )}</span> / ${esc(shortLabel(state.page.instance, 28))}`;
+    )}</span> / ${esc(shortLabel(displayInstanceName(state.page.instance), 28))}`;
     cohortPage.style.display = 'none';
     instancePage.style.display = '';
     if (pptPreviewPage) pptPreviewPage.style.display = 'none';
@@ -3580,6 +4347,7 @@ function renderDbStats(kind) {
       p99: avg('p99'),
       max: avg('max'),
       topDb: top.db,
+      topDbDisplay: displayDbName(top.db),
       topMax: top.max,
     };
   });
@@ -3591,7 +4359,7 @@ function renderDbStats(kind) {
         `<tr><td>${esc(r.metric)}</td><td>${fmt(r.p95, 'dec1')}</td><td>${fmt(r.p99, 'dec1')}</td><td>${fmt(
           r.max,
           'dec1',
-        )}</td><td>${esc(r.topDb)} (${fmt(r.topMax, 'dec1')})</td></tr>`,
+        )}</td><td>${esc(r.topDbDisplay)} (${fmt(r.topMax, 'dec1')})</td></tr>`,
     )
     .join('');
   updateSortHeaderIndicators('dbStatsTable');
@@ -3618,7 +4386,7 @@ function renderTopSql(kind, enabled) {
   tbody.innerHTML = sortedRows
     .map(
       (r) =>
-        `<tr><td>${esc(r.db)}</td><td>${esc(r.sql_id)}</td><td>${fmt(r.elapsed, 'dec1')}</td><td>${fmt(r.execs, 'dec1')}</td><td>${fmt(
+        `<tr><td>${esc(displayDbName(r.db))}</td><td>${esc(r.sql_id)}</td><td>${fmt(r.elapsed, 'dec1')}</td><td>${fmt(r.execs, 'dec1')}</td><td>${fmt(
           r.log_reads,
           'dec1',
         )}</td><td>${fmt(r.phy_read_gb, 'dec1')}</td></tr>`,
@@ -3648,7 +4416,7 @@ function renderSegmentIo(kind, enabled) {
   tbody.innerHTML = sortedRows
     .map(
       (r) =>
-        `<tr><td>${esc(r.db)}</td><td>${esc(r.owner)}</td><td>${esc(r.object_name)}</td><td>${esc(r.object_type)}</td><td>${fmt(
+        `<tr><td>${esc(displayDbName(r.db))}</td><td>${esc(r.owner)}</td><td>${esc(r.object_name)}</td><td>${esc(r.object_type)}</td><td>${fmt(
           r.physical_io_tot,
           'dec1',
         )}</td></tr>`,
@@ -3682,8 +4450,8 @@ function renderDrilldown() {
   const crumbs = [
     `<button class="btn tiny secondary" data-drill-level="global">Global</button>`,
     state.drill.cohort ? `<button class="btn tiny secondary" data-drill-level="cohort">${esc(state.drill.cohort)}</button>` : '',
-    state.drill.db ? `<button class="btn tiny secondary" data-drill-level="db">${esc(shortLabel(state.drill.db, 28))}</button>` : '',
-    state.drill.instance ? `<button class="btn tiny secondary" data-drill-level="instance">${esc(shortLabel(state.drill.instance, 24))}</button>` : '',
+    state.drill.db ? `<button class="btn tiny secondary" data-drill-level="db">${esc(shortLabel(displayDbName(state.drill.db), 28))}</button>` : '',
+    state.drill.instance ? `<button class="btn tiny secondary" data-drill-level="instance">${esc(shortLabel(displayInstanceName(state.drill.instance), 24))}</button>` : '',
   ]
     .filter(Boolean)
     .join(' <span class="muted">/</span> ');
@@ -3753,8 +4521,8 @@ function renderDrilldown() {
           ${[...byDb.values()]
             .sort((a, b) => a.db.localeCompare(b.db))
             .map(
-              (x) =>
-                `<tr class="clickable" data-db-key="${encodeKey(x.db)}"><td>${esc(x.db)}</td><td>${fmt(x.instances, 'int')}</td><td>${fmt(
+                (x) =>
+                `<tr class="clickable" data-db-key="${encodeKey(x.db)}"><td>${esc(displayDbName(x.db))}</td><td>${fmt(x.instances, 'int')}</td><td>${fmt(
                   x.hosts.size,
                   'int',
                 )}</td><td>${fmt(x.vcpu, 'dec1')}</td><td>${fmt(x.mem, 'dec1')}</td><td>${fmt(x.sga, 'dec1')}</td><td>${fmt(
@@ -3778,7 +4546,7 @@ function renderDrilldown() {
   } else if (!state.drill.instance) {
     panel.innerHTML = `
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px;">${crumbs}</div>
-      <p class="muted">Select an instance in database ${esc(state.drill.db)}.</p>
+      <p class="muted">Select an instance in database ${esc(displayDbName(state.drill.db))}.</p>
       <div class="table-wrap">
         <table>
           <thead><tr><th>Instance</th><th>Host</th><th>vCPU</th><th>Logical CPU</th><th>Memory (GB)</th><th>SGA (GB)</th><th>PGA (GB)</th></tr></thead>
@@ -3787,7 +4555,7 @@ function renderDrilldown() {
               .sort((a, b) => a.instance.localeCompare(b.instance))
               .map(
                 (x) =>
-                  `<tr class="clickable" data-instance-key="${encodeKey(x.instance)}"><td>${esc(x.instance)}</td><td>${esc(x.host)}</td><td>${fmt(
+                  `<tr class="clickable" data-instance-key="${encodeKey(x.instance)}"><td>${esc(displayInstanceName(x.instance))}</td><td>${esc(x.host)}</td><td>${fmt(
                     x.init_cpu_count,
                     'dec1',
                   )}</td><td>${fmt(x.logical_cpu_count, 'int')}</td><td>${fmt(x.mem_gb, 'dec1')}</td><td>${fmt(
@@ -3818,14 +4586,14 @@ function renderDrilldown() {
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px;">${crumbs}</div>
       <p class="muted">Instance details.</p>
       <div class="kpi-grid" style="margin-bottom:10px;">
-        <div class="kpi"><div class="name">Instance</div><div class="value" style="font-size:16px;">${esc(item?.instance || '')}</div></div>
+        <div class="kpi"><div class="name">Instance</div><div class="value" style="font-size:16px;">${esc(displayInstanceName(item?.instance || ''))}</div></div>
         <div class="kpi"><div class="name">Host</div><div class="value" style="font-size:16px;">${esc(item?.host || '')}</div></div>
         <div class="kpi"><div class="name">vCPU</div><div class="value">${fmt(item?.init_cpu_count || 0, 'dec1')}</div></div>
         <div class="kpi"><div class="name">Memory (GB)</div><div class="value">${fmt(item?.mem_gb || 0, 'dec1')}</div></div>
         <div class="kpi"><div class="name">SGA (GB)</div><div class="value">${fmt(item?.sga_size_gb || 0, 'dec1')}</div></div>
         <div class="kpi"><div class="name">PGA (GB)</div><div class="value">${fmt(item?.pga_size_gb || 0, 'dec1')}</div></div>
       </div>
-      <p class="muted">Top SQL for database ${esc(state.drill.db)}</p>
+      <p class="muted">Top SQL for database ${esc(displayDbName(state.drill.db))}</p>
       <div class="table-wrap">
         <table>
           <thead><tr><th>SQL ID</th><th>Elapsed</th><th>Execs</th><th>Logical Reads</th><th>Physical Read GB</th></tr></thead>
@@ -3866,8 +4634,19 @@ function updateFromMultiSelect(selectEl, setRef) {
   [...selectEl.selectedOptions].forEach((o) => setRef.add(o.value));
 }
 
+function applyScopeCheckboxChange(kind, value, checked) {
+  if (!state.graph) return;
+  const sel = activeSelection();
+  const setRef = kind === 'cohort' ? sel.cohorts : kind === 'db' ? sel.dbs : sel.instances;
+  if (!setRef) return;
+  if (checked) setRef.add(value);
+  else setRef.delete(value);
+  ensureValidSelection('web');
+  mirrorIfLinked('web');
+  renderAll();
+}
+
 function mirrorIfLinked(originKind) {
-  if (!state.linkSelections) return;
   const targetKind = originKind === 'web' ? 'ppt' : 'web';
   state.selection[targetKind] = {
     cohorts: new Set(state.selection[originKind].cohorts),
@@ -3882,6 +4661,9 @@ function renderAll() {
     renderAiChatAssistant();
     return;
   }
+  state.activeTab = 'web';
+  state.linkSelections = true;
+  mirrorIfLinked('web');
   ensureValidSelection('web');
   ensureValidSelection('ppt');
   renderSelectors();
@@ -4042,6 +4824,7 @@ function initEvents() {
   loadChartTypes();
   loadCardSpans();
   loadCardHeights();
+  loadSidebarCollapsedPref();
   syncCardSizeControls();
   syncCardResizeHandles();
   applySavedCardSpans();
@@ -4053,6 +4836,12 @@ function initEvents() {
   loadSavedLayout();
   setLayoutEditMode(false);
   enableReportActions();
+
+  $('sidebarToggleBtn')?.addEventListener('click', () => {
+    state.sidebarCollapsed = !state.sidebarCollapsed;
+    applySidebarCollapsedUi();
+    saveSidebarCollapsedPref();
+  });
 
   $('layoutEditBtn')?.addEventListener('click', () => {
     setLayoutEditMode(!state.layoutEditMode);
@@ -4230,6 +5019,11 @@ function initEvents() {
     }
   });
 
+  $('referenceRefreshBtn')?.addEventListener('click', async () => {
+    await loadReferenceLibrary();
+    setStatus('Reference library refreshed.');
+  });
+
   $('saveReportBtn')?.addEventListener('click', () => {
     if (!state.raw) {
       setStatus('No data loaded. Load JSON first.');
@@ -4386,7 +5180,7 @@ function initEvents() {
       }
 
       setDefaultsForLoadedRaw(parsed.raw_data);
-      applySavedUiState(parsed.ui_state || {});
+      applySavedUiState(parsed.ui_state || {}, parsed.report_metadata || null);
       enableReportActions();
       renderAll();
       setStatus(
@@ -4399,12 +5193,17 @@ function initEvents() {
     }
   });
 
-  $('linkSelections').addEventListener('change', (e) => {
-    state.linkSelections = e.target.checked;
-    if (state.linkSelections) {
-      mirrorIfLinked(state.activeTab);
-      renderAll();
-    }
+  const metaFields = [
+    ['metaCustomerName', 'customerName'],
+    ['metaOpportunityNumber', 'opportunityNumber'],
+    ['metaSalesRepName', 'salesRepName'],
+    ['metaArchitectName', 'architectName'],
+    ['metaEngineerName', 'engineerName'],
+  ];
+  metaFields.forEach(([id, key]) => {
+    $(id)?.addEventListener('input', (e) => {
+      state.reportMeta[key] = String(e.target.value || '');
+    });
   });
 
   $('cpuScaleToggle')?.addEventListener('click', () => {
@@ -4412,53 +5211,35 @@ function initEvents() {
     renderAll();
   });
 
-  document.querySelectorAll('.tab').forEach((tab) => {
-    tab.addEventListener('click', () => {
-      document.querySelectorAll('.tab').forEach((t) => t.classList.remove('active'));
-      tab.classList.add('active');
-      state.activeTab = tab.dataset.tab;
-      renderAll();
-    });
+  $('cohortSelect').addEventListener('change', (e) => {
+    const kind = e.target?.dataset?.scopeKind;
+    if (kind !== 'cohort') return;
+    applyScopeCheckboxChange('cohort', e.target.value, Boolean(e.target.checked));
   });
 
-  $('cohortSelect').addEventListener('change', () => {
-    if (!state.graph) return;
-    const sel = activeSelection();
-    updateFromMultiSelect($('cohortSelect'), sel.cohorts);
-    ensureValidSelection(state.activeTab);
-    mirrorIfLinked(state.activeTab);
-    renderAll();
+  $('dbSelect').addEventListener('change', (e) => {
+    const kind = e.target?.dataset?.scopeKind;
+    if (kind !== 'db') return;
+    applyScopeCheckboxChange('db', e.target.value, Boolean(e.target.checked));
   });
 
-  $('dbSelect').addEventListener('change', () => {
-    if (!state.graph) return;
-    const sel = activeSelection();
-    updateFromMultiSelect($('dbSelect'), sel.dbs);
-    ensureValidSelection(state.activeTab);
-    mirrorIfLinked(state.activeTab);
-    renderAll();
-  });
-
-  $('instanceSelect').addEventListener('change', () => {
-    if (!state.graph) return;
-    const sel = activeSelection();
-    updateFromMultiSelect($('instanceSelect'), sel.instances);
-    ensureValidSelection(state.activeTab);
-    mirrorIfLinked(state.activeTab);
-    renderAll();
+  $('instanceSelect').addEventListener('change', (e) => {
+    const kind = e.target?.dataset?.scopeKind;
+    if (kind !== 'instance') return;
+    applyScopeCheckboxChange('instance', e.target.value, Boolean(e.target.checked));
   });
 
   $('metricsAll').addEventListener('click', () => {
     const sel = activeSelection();
     state.metricCatalog.forEach((m) => sel.metrics.add(m.id));
-    mirrorIfLinked(state.activeTab);
+    mirrorIfLinked('web');
     renderAll();
   });
 
   $('metricsNone').addEventListener('click', () => {
     const sel = activeSelection();
     sel.metrics.clear();
-    mirrorIfLinked(state.activeTab);
+    mirrorIfLinked('web');
     renderAll();
   });
 
@@ -4468,11 +5249,15 @@ function initEvents() {
     const sel = activeSelection();
     if (e.target.checked) sel.metrics.add(id);
     else sel.metrics.delete(id);
-    mirrorIfLinked(state.activeTab);
+    mirrorIfLinked('web');
     renderAll();
   });
+
+  initCollapsibleSections();
 }
 
 initEvents();
+applyReportMetaToInputs();
 renderAiChatAssistant();
 void probeTemplateApi();
+void loadReferenceLibrary();

@@ -9,6 +9,7 @@ from datetime import datetime
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import quote
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
@@ -192,6 +193,47 @@ class AwrHandler(SimpleHTTPRequestHandler):
                 return
             status = self._chat_status()
             self._send_json(HTTPStatus.OK, {"ok": True, **status})
+            return
+        if self.path == "/api/reference-library":
+            docs_root = Path(self.server.root_path) / "docs"  # type: ignore[attr-defined]
+            if not docs_root.exists() or not docs_root.is_dir():
+                self._send_json(HTTPStatus.OK, {"ok": True, "root": str(docs_root), "docs": []})
+                return
+
+            allowed_ext = {
+                ".pdf",
+                ".md",
+                ".txt",
+                ".json",
+                ".csv",
+                ".log",
+                ".doc",
+                ".docx",
+                ".ppt",
+                ".pptx",
+                ".potx",
+                ".xls",
+                ".xlsx",
+            }
+            docs = []
+            for p in sorted(docs_root.rglob("*")):
+                if not p.is_file():
+                    continue
+                if p.suffix.lower() not in allowed_ext:
+                    continue
+                rel = p.relative_to(Path(self.server.root_path))  # type: ignore[attr-defined]
+                rel_posix = rel.as_posix()
+                docs.append(
+                    {
+                        "name": p.name,
+                        "path": rel_posix,
+                        "url": "/" + quote(rel_posix, safe="/-_.() "),
+                        "size_bytes": p.stat().st_size,
+                        "modified": datetime.fromtimestamp(p.stat().st_mtime).isoformat(timespec="seconds"),
+                    }
+                )
+
+            self._send_json(HTTPStatus.OK, {"ok": True, "root": str(docs_root), "docs": docs})
             return
         return super().do_GET()
 

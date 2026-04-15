@@ -31,50 +31,69 @@
       </div>
     </header>
 
-    <main class="layout">
+    <main id="mainLayout" class="layout">
       <aside class="sidebar">
-        <section class="card">
-          <h2>Selection Mode</h2>
-          <label class="toggle-row">
-            <input id="linkSelections" type="checkbox" checked />
-            Link Web and PPT selections
-          </label>
-          <div class="tabs">
-            <button data-tab="web" class="tab active">Web</button>
-            <button data-tab="ppt" class="tab">PPT</button>
-          </div>
-        </section>
-
-        <section class="card">
-          <h2>Scope</h2>
-          <label>Cohorts</label>
-          <select id="cohortSelect" multiple size="7"></select>
-          <label>Databases</label>
-          <select id="dbSelect" multiple size="7"></select>
-          <label>Instances</label>
-          <select id="instanceSelect" multiple size="8"></select>
-        </section>
-
-        <section class="card">
-          <h2>Metrics</h2>
-          <div class="btn-row">
-            <button id="metricsAll" class="btn tiny">Select all</button>
-            <button id="metricsNone" class="btn tiny secondary">Clear all</button>
-          </div>
-          <div id="metricsList" class="metrics-list"></div>
-        </section>
-
-        <section class="card">
-          <div class="section-head">
-            <h2>PPT Storyboard</h2>
-            <div class="btn-row">
-              <button id="pptSlidesAll" class="btn tiny">All</button>
-              <button id="pptSlidesNone" class="btn tiny secondary">None</button>
+        <div class="sidebar-top">
+          <button id="sidebarToggleBtn" class="burger-btn" type="button" aria-label="Collapse filters" title="Collapse filters">☰</button>
+          <span class="sidebar-title">Filters</span>
+        </div>
+        <div class="sidebar-body">
+          <section class="card">
+            <h2>Engagement Info</h2>
+            <div class="meta-grid">
+              <label for="metaCustomerName">Customer Name (Company)</label>
+              <input id="metaCustomerName" type="text" placeholder="Optional" />
+              <label for="metaOpportunityNumber">Opportunity Number</label>
+              <input id="metaOpportunityNumber" type="text" placeholder="Optional" />
+              <label for="metaSalesRepName">Sales Rep Name</label>
+              <input id="metaSalesRepName" type="text" placeholder="Optional" />
+              <label for="metaArchitectName">Architect Name</label>
+              <input id="metaArchitectName" type="text" placeholder="Optional" />
+              <label for="metaEngineerName">Engineer Name</label>
+              <input id="metaEngineerName" type="text" placeholder="Optional" />
             </div>
-          </div>
-          <p id="pptSlidesStatus" class="muted">Load JSON to generate slides.</p>
-          <div id="pptSlidesList" class="ppt-slides-list"></div>
-        </section>
+          </section>
+
+          <section class="card">
+            <h2>Scope</h2>
+            <label>Cohorts</label>
+            <div id="cohortSelect" class="scope-check-list"></div>
+            <label>Databases</label>
+            <div id="dbSelect" class="scope-check-list"></div>
+            <label>Instances</label>
+            <div id="instanceSelect" class="scope-check-list"></div>
+          </section>
+
+          <section class="card">
+            <h2>Metrics</h2>
+            <div class="btn-row">
+              <button id="metricsAll" class="btn tiny">Select all</button>
+              <button id="metricsNone" class="btn tiny secondary">Clear all</button>
+            </div>
+            <div id="metricsList" class="metrics-list"></div>
+          </section>
+
+          <section class="card">
+            <div class="section-head">
+              <h2>Reference Library</h2>
+              <button id="referenceRefreshBtn" class="btn tiny secondary" type="button">Refresh</button>
+            </div>
+            <p id="referenceBookStatus" class="muted">Loading reference library...</p>
+            <div id="referenceBookList" class="reference-list"></div>
+          </section>
+
+          <section class="card">
+            <div class="section-head">
+              <h2>PPT Storyboard</h2>
+              <div class="btn-row">
+                <button id="pptSlidesAll" class="btn tiny">All</button>
+                <button id="pptSlidesNone" class="btn tiny secondary">None</button>
+              </div>
+            </div>
+            <p id="pptSlidesStatus" class="muted">Load JSON to generate slides.</p>
+            <div id="pptSlidesList" class="ppt-slides-list"></div>
+          </section>
+        </div>
       </aside>
 
       <section class="content">
@@ -93,6 +112,21 @@
         <section class="card" id="globalSummaryCard" data-layout-item="globalSummaryCard">
           <h2>Global Summary</h2>
           <div id="kpiGrid" class="kpi-grid"></div>
+        </section>
+
+        <section class="card" id="sizingParametersCard" data-layout-item="sizingParametersCard">
+          <h2>Sizing Parameters</h2>
+          <div class="chart-box" style="margin-top:10px;">
+            <h3>Utilization Sizing Targets</h3>
+            <p class="muted">VCPU, Memory, IOPS, and Storage box plots (0-100%). Adjust targets using the inputs below.</p>
+            <div class="global-vcpu-sizer-wrap">
+              <div id="globalVcpuSizerChart" class="global-vcpu-sizer-chart"></div>
+              <div id="globalMemSizerChart" class="global-vcpu-sizer-chart"></div>
+              <div id="globalIopsSizerChart" class="global-vcpu-sizer-chart"></div>
+              <div id="globalStorageSizerChart" class="global-vcpu-sizer-chart"></div>
+            </div>
+            <div id="globalSizerControls" class="global-vcpu-sizer-summary" style="margin-top:10px;"></div>
+          </div>
         </section>
 
         <section class="card" id="cohortChartsCard" data-layout-item="cohortChartsCard">

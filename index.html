@@ -23,6 +23,14 @@
           <input id="templateInput" type="file" accept=".potx,.pptx,application/vnd.openxmlformats-officedocument.presentationml.template,application/vnd.openxmlformats-officedocument.presentationml.presentation" hidden />
         </label>
         <button id="saveReportBtn" class="btn secondary" type="button" disabled>Save Report</button>
+        <label class="topbar-select-wrap" for="advisorExportProfile">
+          Advisor Export
+          <select id="advisorExportProfile" class="topbar-select">
+            <option value="compact" selected>Compact</option>
+            <option value="comprehensive">Comprehensive</option>
+          </select>
+        </label>
+        <button id="exportAdvisorJsonBtn" class="btn secondary" type="button" disabled>Export Advisor JSON</button>
         <label class="btn secondary">
           Load Report
           <input id="reportInput" type="file" accept="application/json,.json,.awrreport" hidden />

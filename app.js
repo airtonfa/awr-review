@@ -39,6 +39,7 @@ const state = {
   memorySizingTargetPct: null,
   iopsSizingTargetPct: null,
   storageSizingTargetPct: null,
+  cohortTargets: {},
   layoutEditMode: false,
   layoutDefaultOrder: [],
   layoutDraggingId: null,
@@ -57,6 +58,7 @@ const state = {
   exportInProgress: false,
   templateApiAvailable: null,
   templatePath: '',
+  advisorExportProfile: 'compact',
   referenceLibrary: [],
   reportMeta: {
     customerName: '',
@@ -97,6 +99,7 @@ const SIDEBAR_COLLAPSED_STORAGE_KEY = 'awr_review_sidebar_collapsed_v1';
 const CHATBOT_ENABLED = false;
 const INFRA_TIERS = ['Base Database', 'Exascale', 'Exadata Dedicated', 'Exadata Cloud Services Dedicated'];
 const AWR_DBA_ADVISOR_URL = 'https://chatgpt.com/g/g-69d9751bd6008191afe58d05e76405b6-awr-dba-advisor';
+const TARGET_METRICS = ['vcpu', 'memory', 'iops', 'storage'];
 
 function normalizeReportMeta(meta = {}) {
   const src = meta && typeof meta === 'object' ? meta : {};
@@ -521,14 +524,11 @@ function setDefaultsForLoadedRaw(raw) {
 
   state.drill = { cohort: null, db: null, instance: null };
   state.page = { mode: 'global', cohort: null, instance: null };
-  const defaultCpuStats = computeGlobalInstanceCpuStats('web');
-  state.vcpuSizingTargetPct = defaultCpuStats ? clampTargetPct(defaultCpuStats.p95 * 1.2) : null;
-  const defaultMemStats = computeGlobalInstanceMemoryStats('web');
-  state.memorySizingTargetPct = defaultMemStats ? clampTargetPct(defaultMemStats.p95 * 1.2) : null;
-  const defaultIopsStats = computeGlobalIopsStats('web');
-  state.iopsSizingTargetPct = defaultIopsStats ? clampTargetPct(defaultIopsStats.p95 * 1.2) : null;
-  const defaultStorageStats = computeGlobalStorageStats('web');
-  state.storageSizingTargetPct = defaultStorageStats ? clampTargetPct(defaultStorageStats.p95 * 1.2) : null;
+  state.vcpuSizingTargetPct = 100;
+  state.memorySizingTargetPct = 100;
+  state.iopsSizingTargetPct = 100;
+  state.storageSizingTargetPct = 100;
+  state.cohortTargets = {};
   state.reportMeta = normalizeReportMeta({});
   state.collapsedSections = {};
   applyReportMetaToInputs();
@@ -537,6 +537,8 @@ function setDefaultsForLoadedRaw(raw) {
 function enableReportActions() {
   const saveBtn = $('saveReportBtn');
   if (saveBtn) saveBtn.disabled = !state.raw;
+  const advisorBtn = $('exportAdvisorJsonBtn');
+  if (advisorBtn) advisorBtn.disabled = !state.raw;
   const exportBtn = $('exportBtn');
   if (exportBtn) exportBtn.disabled = !state.raw || !state.pptSlideSelected || state.pptSlideSelected.size === 0;
   const previewExportBtn = $('previewExportBtn');
@@ -570,13 +572,14 @@ function reportStateSnapshot() {
       },
       cpuScaleMode: state.cpuScaleMode,
       vcpuSizingTargetPct:
-        Number.isFinite(Number(state.vcpuSizingTargetPct)) ? Number(state.vcpuSizingTargetPct) : null,
+        Number.isFinite(state.vcpuSizingTargetPct) ? Number(state.vcpuSizingTargetPct) : null,
       memorySizingTargetPct:
-        Number.isFinite(Number(state.memorySizingTargetPct)) ? Number(state.memorySizingTargetPct) : null,
+        Number.isFinite(state.memorySizingTargetPct) ? Number(state.memorySizingTargetPct) : null,
       iopsSizingTargetPct:
-        Number.isFinite(Number(state.iopsSizingTargetPct)) ? Number(state.iopsSizingTargetPct) : null,
+        Number.isFinite(state.iopsSizingTargetPct) ? Number(state.iopsSizingTargetPct) : null,
       storageSizingTargetPct:
-        Number.isFinite(Number(state.storageSizingTargetPct)) ? Number(state.storageSizingTargetPct) : null,
+        Number.isFinite(state.storageSizingTargetPct) ? Number(state.storageSizingTargetPct) : null,
+      cohortTargets: state.cohortTargets && typeof state.cohortTargets === 'object' ? state.cohortTargets : {},
       layoutOrder: getCurrentLayoutOrder(),
       cardSpans: state.cardSpans || {},
       cardHeights: state.cardHeights || {},
@@ -584,6 +587,7 @@ function reportStateSnapshot() {
       chartTypes: state.chartTypes || {},
       collapsedSections: state.collapsedSections || {},
       sidebarCollapsed: Boolean(state.sidebarCollapsed),
+      advisorExportProfile: state.advisorExportProfile === 'comprehensive' ? 'comprehensive' : 'compact',
       reportMeta: normalizeReportMeta(state.reportMeta),
       pptSlidesSelected: [...(state.pptSlideSelected || [])],
       aiChat: {
@@ -604,6 +608,471 @@ function reportStateSnapshot() {
       },
     },
   };
+}
+
+function downloadJsonFile(payload, prefix, pretty = true) {
+  const stamp = new Date().toISOString().replaceAll(':', '-').slice(0, 19);
+  const blob = new Blob([JSON.stringify(payload, null, pretty ? 2 : 0)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `${prefix}_${stamp}.json`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(a.href);
+  return a.download;
+}
+
+function groupedArray(values, size) {
+  const n = Math.max(1, Number(size) || 1);
+  const out = [];
+  for (let i = 0; i < values.length; i += n) out.push(values.slice(i, i + n));
+  return out;
+}
+
+function statsFromRowsForMetric(rows, metric) {
+  if (metric === 'memory') {
+    const vals = rows
+      .map((r) => {
+        const total = Number(r.mem_gb) || 0;
+        const used = (Number(r.sga_size_gb) || 0) + (Number(r.pga_size_gb) || 0);
+        if (total <= 0) return null;
+        return (used / total) * 100;
+      })
+      .filter((v) => Number.isFinite(v));
+    return statsFromValues(vals);
+  }
+  return null;
+}
+
+function computeByCohortFromRows(rows) {
+  const groups = new Map();
+  for (const r of rows) {
+    if (!groups.has(r.cohort)) {
+      groups.set(r.cohort, { cohort: r.cohort, dbs: new Set(), instances: 0, hosts: new Set(), vcpu: 0, mem: 0 });
+    }
+    const g = groups.get(r.cohort);
+    g.dbs.add(r.db);
+    g.hosts.add(r.host);
+    g.instances += 1;
+    g.vcpu += Number(r.init_cpu_count || r.logical_cpu_count || 0);
+    g.mem += Number(r.mem_gb || 0);
+  }
+  return [...groups.values()]
+    .map((g) => ({
+      cohort: g.cohort,
+      dbs: g.dbs.size,
+      instances: g.instances,
+      hosts: g.hosts.size,
+      vcpu: g.vcpu,
+      mem: g.mem,
+      allocated: state.graph.cohortRollups[g.cohort]?.allocated || 0,
+      used: state.graph.cohortRollups[g.cohort]?.used || 0,
+      iops: state.graph.cohortRollups[g.cohort]?.db_iops || 0,
+      logons: state.graph.cohortRollups[g.cohort]?.db_logons || 0,
+    }))
+    .sort((a, b) => a.cohort.localeCompare(b.cohort));
+}
+
+function computeScopedCpuStats(rows, cohorts) {
+  const values = [];
+  cohorts.forEach((cohort) => {
+    const base = resolveCpuSeriesForCohort(cohort);
+    if (!base) return;
+    const cRows = rows.filter((r) => r.cohort === cohort);
+    if (!cRows.length) return;
+    const total = cRows.reduce((a, r) => a + (Number(r.init_cpu_count) || 0), 0);
+    const fallbackShare = 1 / cRows.length;
+    cRows.forEach((r) => {
+      const share = total > 0 ? (Number(r.init_cpu_count) || 0) / total : fallbackShare;
+      base.y.forEach((v) => values.push((Number(v) || 0) * share));
+    });
+  });
+  return statsFromValues(values);
+}
+
+function computeScopedIopsStats(cohortSet, dbSet) {
+  const rows = (state.graph?.dbStats || []).filter(
+    (r) =>
+      cohortSet.has(r.cohort) &&
+      dbSet.has(r.db) &&
+      r.metric === 'DB IOPS' &&
+      (!r.summary_of || r.summary_of === 'cdb'),
+  );
+  if (!rows.length) return null;
+  const cap = Math.max(
+    ...rows.map((r) => Math.max(Number(r.max) || 0, Number(r.p99) || 0, Number(r.p95) || 0)),
+    0,
+  );
+  if (!Number.isFinite(cap) || cap <= 0) return null;
+  const values = rows
+    .flatMap((r) => [r.min, r.p30, r.p50, r.p70, r.p95, r.p99, r.max])
+    .map((v) => ((Number(v) || 0) / cap) * 100)
+    .filter((v) => Number.isFinite(v));
+  return statsFromValues(values);
+}
+
+function computeScopedStorageStats(cohortSet, dbSet) {
+  const allocByDb = new Map();
+  const usedByDb = new Map();
+  (state.graph?.dbStats || []).forEach((r) => {
+    if (!cohortSet.has(r.cohort)) return;
+    if (!dbSet.has(r.db)) return;
+    if (r.summary_of && r.summary_of !== 'cdb') return;
+    if (r.metric === 'Allocated Storage (GB)') allocByDb.set(r.db, Number(r.p95 || r.max || 0));
+    if (r.metric === 'Used Storage (GB)') usedByDb.set(r.db, Number(r.p95 || r.max || 0));
+  });
+  const vals = [...allocByDb.keys()]
+    .map((db) => {
+      const a = allocByDb.get(db) || 0;
+      const u = usedByDb.get(db) || 0;
+      if (a <= 0) return null;
+      return (u / a) * 100;
+    })
+    .filter((v) => Number.isFinite(v));
+  return statsFromValues(vals);
+}
+
+function filterRawDataForScope(raw, cohortSet, dbSet, instanceSet) {
+  const out = {};
+  Object.entries(raw || {}).forEach(([k, v]) => {
+    if (!Array.isArray(v)) out[k] = v;
+  });
+  out.instances = (raw.instances || []).filter((r) => {
+    const c = r.cdb_cohort || r.db_cohort || 'UNASSIGNED';
+    const db = r.cdb || r.WHICH_DB || 'UNKNOWN_DB';
+    const inst = r.db || `${db}$${r.host || 'UNKNOWN_HOST'}`;
+    return cohortSet.has(c) && dbSet.has(db) && instanceSet.has(inst);
+  });
+  out.database_statistics = (raw.database_statistics || []).filter((r) => {
+    const c = r.cdb_cohort || 'UNASSIGNED';
+    const db = r.cdb || 'UNKNOWN_DB';
+    return cohortSet.has(c) && dbSet.has(db);
+  });
+  out.top_sql = (raw.top_sql || []).filter((r) => dbSet.has(r.cdb || 'UNKNOWN_DB'));
+  out.segment_io = (raw.segment_io || []).filter((r) => dbSet.has(r.cdb || 'UNKNOWN_DB'));
+  out.cohort_rollups = (raw.cohort_rollups || []).filter((r) => cohortSet.has(r.Name || ''));
+  out.databases = (raw.databases || []).filter((d) => dbSet.has(d.cdb || d.WHICH_DB || 'UNKNOWN_DB'));
+  out.properties_database = (raw.properties_database || []).filter((d) => dbSet.has(d.WHICH_DB || d.cdb || 'UNKNOWN_DB'));
+  out.plots_html = (raw.plots_html || []).filter((p) => {
+    const cohortHint = String(p?.cohort || p?.name || p?.title || p || '').toUpperCase();
+    return [...cohortSet].some((c) => cohortHint.includes(String(c).toUpperCase()));
+  });
+  return out;
+}
+
+function buildCompactDbStatsSnapshot(scopedRaw) {
+  const keepMetrics = new Set([
+    'DB IOPS',
+    'DB CPU',
+    'DB Memory (MB)',
+    'Allocated Storage (GB)',
+    'Used Storage (GB)',
+    'PGA in use',
+    'SGA in use',
+  ]);
+  const rows = (scopedRaw?.database_statistics || [])
+    .filter((r) => keepMetrics.has(String(r.metric || '')))
+    .map((r) => ({
+      cohort: r.cdb_cohort || 'UNASSIGNED',
+      db: r.cdb || 'UNKNOWN_DB',
+      metric: String(r.metric || ''),
+      p95: Number(Number(r.p95 || 0).toFixed(4)),
+      max: Number(Number(r.max || 0).toFixed(4)),
+      summary_of: r.summary_of || '',
+    }));
+
+  return rows.slice(0, 1200);
+}
+
+function buildComprehensiveDbStatsSnapshot(scopedRaw) {
+  const keepMetrics = new Set([
+    'DB IOPS',
+    'DB CPU',
+    'DB Memory (MB)',
+    'Allocated Storage (GB)',
+    'Used Storage (GB)',
+    'PGA in use',
+    'SGA in use',
+    'CPU Utilization (%)',
+    'Read IO MBPS',
+    'Write IO MBPS',
+  ]);
+  const rows = (scopedRaw?.database_statistics || [])
+    .filter((r) => keepMetrics.has(String(r.metric || '')))
+    .map((r) => ({
+      cohort: r.cdb_cohort || 'UNASSIGNED',
+      db: r.cdb || 'UNKNOWN_DB',
+      metric: String(r.metric || ''),
+      min: Number(Number(r.min || 0).toFixed(4)),
+      p30: Number(Number(r.p30 || 0).toFixed(4)),
+      p50: Number(Number(r.p50 || 0).toFixed(4)),
+      p70: Number(Number(r.p70 || 0).toFixed(4)),
+      p95: Number(Number(r.p95 || 0).toFixed(4)),
+      p99: Number(Number(r.p99 || 0).toFixed(4)),
+      max: Number(Number(r.max || 0).toFixed(4)),
+      summary_of: r.summary_of || '',
+    }));
+  return rows.slice(0, 3500);
+}
+
+function buildDbMetricSummary(cohortSet, dbSet) {
+  const keep = new Set([
+    'DB CPU',
+    'DB IOPS',
+    'DB Memory (MB)',
+    'Allocated Storage (GB)',
+    'Used Storage (GB)',
+    'PGA in use',
+    'SGA in use',
+  ]);
+  const byDb = new Map();
+  (state.graph?.dbStats || []).forEach((r) => {
+    if (!cohortSet.has(r.cohort)) return;
+    if (!dbSet.has(r.db)) return;
+    if (!keep.has(String(r.metric || ''))) return;
+    if (r.summary_of && r.summary_of !== 'cdb') return;
+    if (!byDb.has(r.db)) byDb.set(r.db, {});
+    byDb.get(r.db)[r.metric] = {
+      p95: Number(Number(r.p95 || 0).toFixed(4)),
+      p99: Number(Number(r.p99 || 0).toFixed(4)),
+      max: Number(Number(r.max || 0).toFixed(4)),
+    };
+  });
+  return byDb;
+}
+
+function buildAdvisorTechnicalSummary(rows, cohortSet, dbSet) {
+  const dbMetricSummary = buildDbMetricSummary(cohortSet, dbSet);
+  const byDbRows = new Map();
+  rows.forEach((r) => {
+    if (!byDbRows.has(r.db)) byDbRows.set(r.db, []);
+    byDbRows.get(r.db).push(r);
+  });
+
+  const dbs = [...byDbRows.keys()].sort((a, b) => a.localeCompare(b));
+  const db_summary = dbs.map((db) => {
+    const rws = byDbRows.get(db) || [];
+    const vcpu = rws.reduce((a, x) => a + (Number(x.init_cpu_count || x.logical_cpu_count || 0) || 0), 0);
+    const mem = rws.reduce((a, x) => a + (Number(x.mem_gb || 0) || 0), 0);
+    const sga = rws.reduce((a, x) => a + (Number(x.sga_size_gb || 0) || 0), 0);
+    const pga = rws.reduce((a, x) => a + (Number(x.pga_size_gb || 0) || 0), 0);
+    const m = dbMetricSummary.get(db) || {};
+    return {
+      db,
+      db_name: displayDbName(db),
+      cohort: rws[0]?.cohort || 'UNASSIGNED',
+      version: state.graph?.dbVersionByDb?.[db] || 'Unknown',
+      instances: rws.length,
+      hosts: [...new Set(rws.map((x) => x.host))].length,
+      vcpu_total: Number(vcpu.toFixed(3)),
+      memory_gb_total: Number(mem.toFixed(3)),
+      sga_gb_total: Number(sga.toFixed(3)),
+      pga_gb_total: Number(pga.toFixed(3)),
+      db_cpu: m['DB CPU'] || null,
+      db_iops: m['DB IOPS'] || null,
+      db_memory_mb: m['DB Memory (MB)'] || null,
+      allocated_storage_gb: m['Allocated Storage (GB)'] || null,
+      used_storage_gb: m['Used Storage (GB)'] || null,
+      sga_in_use: m['SGA in use'] || null,
+      pga_in_use: m['PGA in use'] || null,
+    };
+  });
+
+  const top_sql = (state.graph?.topSql || [])
+    .filter((r) => dbSet.has(r.db))
+    .sort((a, b) => (Number(b.elapsed) || 0) - (Number(a.elapsed) || 0))
+    .slice(0, 25)
+    .map((r) => ({
+      db: r.db,
+      db_name: displayDbName(r.db),
+      sql_id: r.sql_id,
+      elapsed: Number(Number(r.elapsed || 0).toFixed(3)),
+      execs: Number(Number(r.execs || 0).toFixed(3)),
+      log_reads: Number(Number(r.log_reads || 0).toFixed(3)),
+      phy_read_gb: Number(Number(r.phy_read_gb || 0).toFixed(3)),
+    }));
+
+  const segment_io = (state.graph?.segmentIo || [])
+    .filter((r) => dbSet.has(r.db))
+    .sort((a, b) => (Number(b.physical_io_tot) || 0) - (Number(a.physical_io_tot) || 0))
+    .slice(0, 25)
+    .map((r) => ({
+      db: r.db,
+      db_name: displayDbName(r.db),
+      owner: r.owner,
+      object_name: r.object_name,
+      object_type: r.object_type,
+      physical_io_tot: Number(Number(r.physical_io_tot || 0).toFixed(3)),
+    }));
+
+  const timeline = [...cohortSet]
+    .sort((a, b) => a.localeCompare(b))
+    .map((cohort) => {
+      const ts = resolveCpuSeriesForCohort(cohort);
+      if (!ts || !Array.isArray(ts.x) || !ts.x.length) {
+        return { cohort, points: 0, start: null, end: null, cpu_pct: null };
+      }
+      const vals = (ts.y || []).map((v) => Number(v)).filter((v) => Number.isFinite(v));
+      const st = statsFromValues(vals);
+      return {
+        cohort,
+        points: ts.x.length,
+        start: ts.x[0] || null,
+        end: ts.x[ts.x.length - 1] || null,
+        cpu_pct: st
+          ? {
+              p50: Number(Number(st.p50 || 0).toFixed(4)),
+              p95: Number(Number(st.p95 || 0).toFixed(4)),
+              max: Number(Number(st.max || 0).toFixed(4)),
+            }
+          : null,
+      };
+    });
+
+  return {
+    cohort_timeline: timeline,
+    db_summary,
+    top_sql,
+    segment_io,
+  };
+}
+
+function buildAdvisorExportPayloadForScope(kind, rows, chunkCohorts, allRows, profile = 'compact') {
+  if (!state.raw || !state.graph) return null;
+  const sel = state.selection[kind];
+  const byCohort = computeByCohortFromRows(rows);
+  ensureCohortTargetsInitialized(kind);
+  const globalTargets = {
+    vcpu_pct: getGlobalTarget('vcpu'),
+    memory_pct: getGlobalTarget('memory'),
+    iops_pct: getGlobalTarget('iops'),
+    storage_pct: getGlobalTarget('storage'),
+  };
+  const allByCohort = computeByCohortFromRows(allRows);
+  const metricWeightTotals = {
+    vcpu: allByCohort.reduce((a, c) => a + (Number(c.vcpu) || 0), 0),
+    memory: allByCohort.reduce((a, c) => a + (Number(c.mem) || 0), 0),
+    iops: allByCohort.reduce((a, c) => a + (Number(c.iops) || 0), 0),
+    storage: allByCohort.reduce((a, c) => a + (Number(c.allocated) || 0), 0),
+  };
+  const cohortSet = new Set(chunkCohorts);
+  const dbSet = new Set(rows.map((r) => r.db));
+  const instSet = new Set(rows.map((r) => r.instance));
+  const scopedRaw = filterRawDataForScope(state.raw, cohortSet, dbSet, instSet);
+  const technicalSummary = buildAdvisorTechnicalSummary(rows, cohortSet, dbSet);
+  const cohorts = byCohort.map((c) => {
+    const target = ensureCohortTargetContainer(c.cohort);
+    const wVcpu = Number(c.vcpu) || 0;
+    const wMem = Number(c.mem) || 0;
+    const wIops = Number(c.iops) || 0;
+    const wStorage = Number(c.allocated) || 0;
+    return {
+      cohort: c.cohort,
+      summary: c,
+      targets_pct: {
+        vcpu_pct: parseTargetPctOrDefault(target.vcpu, globalTargets.vcpu_pct),
+        memory_pct: parseTargetPctOrDefault(target.memory, globalTargets.memory_pct),
+        iops_pct: parseTargetPctOrDefault(target.iops, globalTargets.iops_pct),
+        storage_pct: parseTargetPctOrDefault(target.storage, globalTargets.storage_pct),
+      },
+      weighted_share_pct: {
+        vcpu: metricWeightTotals.vcpu > 0 ? (wVcpu / metricWeightTotals.vcpu) * 100 : 0,
+        memory: metricWeightTotals.memory > 0 ? (wMem / metricWeightTotals.memory) * 100 : 0,
+        iops: metricWeightTotals.iops > 0 ? (wIops / metricWeightTotals.iops) * 100 : 0,
+        storage: metricWeightTotals.storage > 0 ? (wStorage / metricWeightTotals.storage) * 100 : 0,
+      },
+      stats: {
+        cpu_pct: computeScopedCpuStats(rows.filter((r) => r.cohort === c.cohort), [c.cohort]),
+        memory_pct: statsFromRowsForMetric(rows.filter((r) => r.cohort === c.cohort), 'memory'),
+        iops_pct: computeScopedIopsStats(new Set([c.cohort]), new Set(rows.filter((r) => r.cohort === c.cohort).map((r) => r.db))),
+        storage_pct: computeScopedStorageStats(new Set([c.cohort]), new Set(rows.filter((r) => r.cohort === c.cohort).map((r) => r.db))),
+      },
+    };
+  });
+
+  return {
+    schema_version: 1,
+    exported_at: new Date().toISOString(),
+    purpose: 'ChatGPT AWR DBA Advisor context',
+    export_profile: profile === 'comprehensive' ? 'comprehensive_v1' : 'compact_v1',
+    report_metadata: normalizeReportMeta(state.reportMeta),
+    scope: {
+      mode: kind,
+      selected_cohorts: [...chunkCohorts],
+      selected_databases: [...dbSet],
+      selected_instances: [...instSet],
+      selected_metrics: [...sel.metrics],
+      selected_instances_count: rows.length,
+    },
+    targets: {
+      global_pct: globalTargets,
+      cohorts,
+    },
+    summary: {
+      global: computeSummaryFromRows(rows),
+      by_cohort: byCohort,
+      cpu_pct: computeScopedCpuStats(rows, chunkCohorts),
+      memory_pct: statsFromRowsForMetric(rows, 'memory'),
+      iops_pct: computeScopedIopsStats(cohortSet, dbSet),
+      storage_pct: computeScopedStorageStats(cohortSet, dbSet),
+    },
+    selected_instances: rows.map((r) => ({
+      cohort: r.cohort,
+      db: r.db,
+      db_name: displayDbName(r.db),
+      instance: r.instance,
+      instance_name: displayInstanceName(r.instance),
+      host: r.host,
+      vcpu: Number(r.init_cpu_count || r.logical_cpu_count || 0),
+      memory_gb: Number(r.mem_gb || 0),
+      sga_gb: Number(r.sga_size_gb || 0),
+      pga_gb: Number(r.pga_size_gb || 0),
+      db_version: state.graph?.dbVersionByDb?.[r.db] || 'Unknown',
+      rac: Boolean(r.is_rac || r.rac || r.rac_instance || r.clustered),
+      pdb_count: Number(r.pdb_count || 0),
+    })),
+    compact_data: {
+      cohort_rollups: (scopedRaw.cohort_rollups || []).map((r) => ({
+        cohort: r.Name || '',
+        allocated_storage_gb: Number(Number(r['Allocated Storage (GB)'] || 0).toFixed(3)),
+        used_storage_gb: Number(Number(r['Used Storage (GB)'] || 0).toFixed(3)),
+        db_iops: Number(Number(r['DB IOPS'] || 0).toFixed(3)),
+        db_vcpu: Number(Number(r['DB vCPU'] || 0).toFixed(3)),
+      })),
+      technical_summary: technicalSummary,
+    },
+    ...(profile === 'comprehensive'
+      ? {
+          comprehensive_data: {
+            database_statistics: buildComprehensiveDbStatsSnapshot(scopedRaw),
+            top_sql: (scopedRaw.top_sql || []).slice(0, 120),
+            segment_io: (scopedRaw.segment_io || []).slice(0, 120),
+          },
+        }
+      : {}),
+  };
+}
+
+function buildAdvisorExportPayloads(kind = 'web', cohortsPerFile = 1, profile = 'compact') {
+  if (!state.raw || !state.graph) return [];
+  const allRows = selectedInstances(kind);
+  const cohorts = [...new Set(allRows.map((r) => r.cohort))].sort((a, b) => a.localeCompare(b));
+  const chunks = groupedArray(cohorts, cohortsPerFile);
+  return chunks
+    .map((chunkCohorts, idx) => {
+      const chunkSet = new Set(chunkCohorts);
+      const rows = allRows.filter((r) => chunkSet.has(r.cohort));
+      const payload = buildAdvisorExportPayloadForScope(kind, rows, chunkCohorts, allRows, profile);
+      if (!payload) return null;
+      payload.chunk = {
+        index: idx + 1,
+        total: chunks.length,
+        cohorts_per_file: cohortsPerFile,
+      };
+      return payload;
+    })
+    .filter(Boolean);
 }
 
 function applySavedUiState(uiState = {}, reportMeta = null) {
@@ -627,14 +1096,11 @@ function applySavedUiState(uiState = {}, reportMeta = null) {
   state.selection.ppt = selectionFromPojo(uiState.selection?.ppt, fallbackPpt);
 
   state.cpuScaleMode = uiState.cpuScaleMode === 'fixed100' ? 'fixed100' : 'dynamic';
-  state.vcpuSizingTargetPct =
-    Number.isFinite(Number(uiState.vcpuSizingTargetPct)) ? Math.max(0, Math.min(200, Number(uiState.vcpuSizingTargetPct))) : null;
-  state.memorySizingTargetPct =
-    Number.isFinite(Number(uiState.memorySizingTargetPct)) ? Math.max(0, Math.min(200, Number(uiState.memorySizingTargetPct))) : null;
-  state.iopsSizingTargetPct =
-    Number.isFinite(Number(uiState.iopsSizingTargetPct)) ? Math.max(0, Math.min(200, Number(uiState.iopsSizingTargetPct))) : null;
-  state.storageSizingTargetPct =
-    Number.isFinite(Number(uiState.storageSizingTargetPct)) ? Math.max(0, Math.min(200, Number(uiState.storageSizingTargetPct))) : null;
+  state.vcpuSizingTargetPct = parseTargetPctOrDefault(uiState.vcpuSizingTargetPct, 100);
+  state.memorySizingTargetPct = parseTargetPctOrDefault(uiState.memorySizingTargetPct, 100);
+  state.iopsSizingTargetPct = parseTargetPctOrDefault(uiState.iopsSizingTargetPct, 100);
+  state.storageSizingTargetPct = parseTargetPctOrDefault(uiState.storageSizingTargetPct, 100);
+  state.cohortTargets = uiState.cohortTargets && typeof uiState.cohortTargets === 'object' ? uiState.cohortTargets : {};
   state.chartSizes = uiState.chartSizes && typeof uiState.chartSizes === 'object' ? uiState.chartSizes : {};
   state.cardSpans = uiState.cardSpans && typeof uiState.cardSpans === 'object' ? uiState.cardSpans : {};
   state.cardHeights = uiState.cardHeights && typeof uiState.cardHeights === 'object' ? uiState.cardHeights : {};
@@ -643,25 +1109,24 @@ function applySavedUiState(uiState = {}, reportMeta = null) {
   if (Object.prototype.hasOwnProperty.call(uiState || {}, 'sidebarCollapsed')) {
     state.sidebarCollapsed = Boolean(uiState.sidebarCollapsed);
   }
+  state.advisorExportProfile = uiState.advisorExportProfile === 'comprehensive' ? 'comprehensive' : 'compact';
   saveSidebarCollapsedPref();
   applySidebarCollapsedUi();
+  const advisorProfileSelect = $('advisorExportProfile');
+  if (advisorProfileSelect) advisorProfileSelect.value = state.advisorExportProfile;
   state.reportMeta = normalizeReportMeta(reportMeta || uiState.reportMeta || {});
 
-  if (!Number.isFinite(Number(state.vcpuSizingTargetPct))) {
-    const defaultCpuStats = computeGlobalInstanceCpuStats('web');
-    state.vcpuSizingTargetPct = defaultCpuStats ? clampTargetPct(defaultCpuStats.p95 * 1.2) : null;
+  if (!Number.isFinite(state.vcpuSizingTargetPct)) {
+    state.vcpuSizingTargetPct = 100;
   }
-  if (!Number.isFinite(Number(state.memorySizingTargetPct))) {
-    const defaultMemStats = computeGlobalInstanceMemoryStats('web');
-    state.memorySizingTargetPct = defaultMemStats ? clampTargetPct(defaultMemStats.p95 * 1.2) : null;
+  if (!Number.isFinite(state.memorySizingTargetPct)) {
+    state.memorySizingTargetPct = 100;
   }
-  if (!Number.isFinite(Number(state.iopsSizingTargetPct))) {
-    const defaultIopsStats = computeGlobalIopsStats('web');
-    state.iopsSizingTargetPct = defaultIopsStats ? clampTargetPct(defaultIopsStats.p95 * 1.2) : null;
+  if (!Number.isFinite(state.iopsSizingTargetPct)) {
+    state.iopsSizingTargetPct = 100;
   }
-  if (!Number.isFinite(Number(state.storageSizingTargetPct))) {
-    const defaultStorageStats = computeGlobalStorageStats('web');
-    state.storageSizingTargetPct = defaultStorageStats ? clampTargetPct(defaultStorageStats.p95 * 1.2) : null;
+  if (!Number.isFinite(state.storageSizingTargetPct)) {
+    state.storageSizingTargetPct = 100;
   }
   applyReportMetaToInputs();
   state.pptSlideSelected = new Set(Array.isArray(uiState.pptSlidesSelected) ? uiState.pptSlidesSelected : []);
@@ -3124,17 +3589,111 @@ function clampPct(v) {
   return Math.max(0, Math.min(100, n));
 }
 
+function nonNegativePct(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return 0;
+  return Math.max(0, n);
+}
+
+function sizerAxisMax(values, fallback = 100) {
+  const clean = (values || []).map((v) => Number(v)).filter((v) => Number.isFinite(v) && v >= 0);
+  const rawMax = clean.length ? Math.max(...clean) : fallback;
+  const base = Math.max(fallback, rawMax);
+  if (base <= 10) return 10;
+  if (base <= 25) return 25;
+  if (base <= 50) return 50;
+  if (base <= 100) return 100;
+  if (base <= 150) return 150;
+  if (base <= 200) return 200;
+  return Math.ceil(base / 50) * 50;
+}
+
 function clampTargetPct(v) {
   const n = Number(v);
   if (!Number.isFinite(n)) return 0;
   return Math.max(0, Math.min(200, n));
 }
 
+function parseTargetPctOrDefault(raw, fallback = 100) {
+  if (raw === null || raw === undefined) return fallback;
+  const s = String(raw).trim();
+  if (!s) return fallback;
+  const n = Number(s);
+  if (!Number.isFinite(n)) return fallback;
+  return clampTargetPct(n);
+}
+
+function globalTargetField(metric) {
+  if (metric === 'vcpu') return 'vcpuSizingTargetPct';
+  if (metric === 'memory') return 'memorySizingTargetPct';
+  if (metric === 'iops') return 'iopsSizingTargetPct';
+  return 'storageSizingTargetPct';
+}
+
+function getGlobalTarget(metric) {
+  return parseTargetPctOrDefault(state[globalTargetField(metric)], 100);
+}
+
+function setGlobalTarget(metric, value) {
+  state[globalTargetField(metric)] = parseTargetPctOrDefault(value, 100);
+}
+
+function ensureCohortTargetContainer(cohort) {
+  if (!state.cohortTargets || typeof state.cohortTargets !== 'object') state.cohortTargets = {};
+  if (!state.cohortTargets[cohort] || typeof state.cohortTargets[cohort] !== 'object') state.cohortTargets[cohort] = {};
+  return state.cohortTargets[cohort];
+}
+
+function ensureCohortTargetsInitialized(kind) {
+  const rows = computeByCohort(kind);
+  rows.forEach((r) => {
+    const item = ensureCohortTargetContainer(r.cohort);
+    TARGET_METRICS.forEach((m) => {
+      if (!Number.isFinite(Number(item[m]))) item[m] = getGlobalTarget(m);
+      item[m] = clampTargetPct(item[m]);
+    });
+  });
+}
+
+function cascadeGlobalTargetsToCohorts(kind, metric) {
+  ensureCohortTargetsInitialized(kind);
+  const rows = computeByCohort(kind);
+  const v = getGlobalTarget(metric);
+  rows.forEach((r) => {
+    const item = ensureCohortTargetContainer(r.cohort);
+    item[metric] = v;
+  });
+}
+
+function cohortWeight(metric, row) {
+  if (metric === 'vcpu') return Number(row.vcpu) || 0;
+  if (metric === 'memory') return Number(row.mem) || 0;
+  if (metric === 'iops') return Number(row.iops) || 0;
+  return Number(row.allocated) || 0;
+}
+
+function recomputeGlobalTargetFromCohorts(kind, metric) {
+  ensureCohortTargetsInitialized(kind);
+  const rows = computeByCohort(kind);
+  if (!rows.length) return;
+  const sumW = rows.reduce((a, r) => a + cohortWeight(metric, r), 0);
+  const fallbackW = rows.length > 0 ? 1 / rows.length : 0;
+  let acc = 0;
+  rows.forEach((r) => {
+    const w = sumW > 0 ? cohortWeight(metric, r) / sumW : fallbackW;
+    const item = ensureCohortTargetContainer(r.cohort);
+    const v = parseTargetPctOrDefault(item[metric], getGlobalTarget(metric));
+    acc += w * v;
+  });
+  setGlobalTarget(metric, acc);
+}
+
 function computeGlobalInstanceCpuStats(kind) {
   const sel = state.selection[kind];
-  const series = [...sel.cohorts].flatMap((cohort) => buildInstanceCpuTimeSeries(kind, cohort));
-  const vals = series
-    .flatMap((s) => s.y || [])
+  const vals = [...sel.cohorts]
+    .map((cohort) => resolveCpuSeriesForCohort(cohort))
+    .filter(Boolean)
+    .flatMap((series) => series.y || [])
     .map((v) => Number(v))
     .filter((v) => Number.isFinite(v));
   if (!vals.length) return null;
@@ -3232,7 +3791,160 @@ function computeGlobalStorageStats(kind) {
   };
 }
 
-function renderVerticalSizerChart(chartNode, stats, selectedPct, titleText, colorMain) {
+function statsFromValues(values) {
+  const clean = (values || []).map((v) => Number(v)).filter((v) => Number.isFinite(v));
+  if (!clean.length) return null;
+  const sorted = [...clean].sort((a, b) => a - b);
+  return {
+    count: sorted.length,
+    min: quantileFromSorted(sorted, 0),
+    p30: quantileFromSorted(sorted, 0.3),
+    p50: quantileFromSorted(sorted, 0.5),
+    p70: quantileFromSorted(sorted, 0.7),
+    p95: quantileFromSorted(sorted, 0.95),
+    p99: quantileFromSorted(sorted, 0.99),
+    max: quantileFromSorted(sorted, 1),
+  };
+}
+
+function computeCohortCpuStats(kind, cohort) {
+  const sel = state.selection[kind];
+  if (!sel?.cohorts?.has(cohort)) return null;
+  const series = resolveCpuSeriesForCohort(cohort);
+  if (!series) return null;
+  return statsFromValues(series.y || []);
+}
+
+function computeCohortMemoryStats(kind, cohort) {
+  const rows = selectedInstances(kind).filter((r) => r.cohort === cohort);
+  const vals = rows
+    .map((r) => {
+      const total = Number(r.mem_gb) || 0;
+      const used = (Number(r.sga_size_gb) || 0) + (Number(r.pga_size_gb) || 0);
+      if (total <= 0) return null;
+      return (used / total) * 100;
+    })
+    .filter((v) => Number.isFinite(v));
+  return statsFromValues(vals);
+}
+
+function computeCohortIopsStats(kind, cohort) {
+  const sel = state.selection[kind];
+  const rows = (state.graph?.dbStats || []).filter(
+    (r) =>
+      r.cohort === cohort &&
+      sel.dbs.has(r.db) &&
+      r.metric === 'DB IOPS' &&
+      (!r.summary_of || r.summary_of === 'cdb'),
+  );
+  if (!rows.length) return null;
+  const cap = Math.max(...rows.map((r) => Math.max(Number(r.max) || 0, Number(r.p99) || 0, Number(r.p95) || 0)), 0);
+  if (!Number.isFinite(cap) || cap <= 0) return null;
+  const vals = rows
+    .flatMap((r) => [r.min, r.p30, r.p50, r.p70, r.p95, r.p99, r.max])
+    .map((v) => ((Number(v) || 0) / cap) * 100)
+    .filter((v) => Number.isFinite(v));
+  return statsFromValues(vals);
+}
+
+function computeCohortStorageStats(kind, cohort) {
+  const sel = state.selection[kind];
+  const allocByDb = new Map();
+  const usedByDb = new Map();
+  (state.graph?.dbStats || []).forEach((r) => {
+    if (r.cohort !== cohort) return;
+    if (!sel.dbs.has(r.db)) return;
+    if (r.summary_of && r.summary_of !== 'cdb') return;
+    if (r.metric === 'Allocated Storage (GB)') allocByDb.set(r.db, Number(r.p95 || r.max || 0));
+    if (r.metric === 'Used Storage (GB)') usedByDb.set(r.db, Number(r.p95 || r.max || 0));
+  });
+  const vals = [...allocByDb.keys()]
+    .map((db) => {
+      const a = allocByDb.get(db) || 0;
+      const u = usedByDb.get(db) || 0;
+      if (a <= 0) return null;
+      return (u / a) * 100;
+    })
+    .filter((v) => Number.isFinite(v));
+  return statsFromValues(vals);
+}
+
+function computeGlobalCohortMetricRows(kind, metric) {
+  return computeByCohort(kind)
+    .map((row) => {
+      const stats =
+        metric === 'vcpu'
+          ? computeCohortCpuStats(kind, row.cohort)
+          : metric === 'memory'
+            ? computeCohortMemoryStats(kind, row.cohort)
+            : metric === 'iops'
+              ? computeCohortIopsStats(kind, row.cohort)
+              : computeCohortStorageStats(kind, row.cohort);
+      if (!stats) return null;
+      return { cohort: row.cohort, ...stats };
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.cohort.localeCompare(b.cohort));
+}
+
+function cohortProvisionLines(kind, cohort, metric) {
+  const BASE = { cpu: 256, mem: 512, iops: 8000, storage_tb: 80 };
+  const XS = { ecpu: 200, storage_tb: 100 };
+  const EXA = { ecpu: 1520, mem: 973, iops: 89000000, storage_tb: 5000 };
+  const rows = selectedInstances(kind).filter((r) => r.cohort === cohort);
+  const c = computeByCohort(kind).find((x) => x.cohort === cohort);
+  if (!rows.length || !c) return [];
+
+  const maxInstCpu = Math.max(...rows.map((r) => Number(r.init_cpu_count || r.logical_cpu_count || 0)), 0);
+  const maxInstMem = Math.max(...rows.map((r) => Number(r.mem_gb || 0)), 0);
+  const maxInstCount = Math.max(rows.length, 1);
+
+  const iopsByDb = aggregateMetricByDb(kind, 'DB IOPS', (v) => v, cohort);
+  const maxInstIops = Math.max(...iopsByDb.map((r) => Number(r.p95 || r.max || 0)), 0);
+  const cohortIops = Math.max(...iopsByDb.map((r) => Number(r.p95 || r.max || 0)), 0);
+
+  const storageByDb = aggregateMetricByDb(kind, 'Allocated Storage (GB)', (v) => v, cohort);
+  const maxInstStorageTb = Math.max(...storageByDb.map((r) => Number(r.p95 || r.max || 0) / 1024), 0);
+  const cohortStorageTb = Number(c.allocated || 0) / 1024;
+
+  const cohortCpuEcpu = Number(c.vcpu || 0) * 2;
+
+  const utilBase =
+    metric === 'vcpu'
+      ? (maxInstCpu / BASE.cpu) * 100
+      : metric === 'memory'
+        ? (maxInstMem / BASE.mem) * 100
+        : metric === 'iops'
+          ? (maxInstIops / BASE.iops) * 100
+          : (maxInstStorageTb / BASE.storage_tb) * 100;
+
+  const utilXs =
+    metric === 'vcpu'
+      ? (cohortCpuEcpu / XS.ecpu) * 100
+      : metric === 'memory'
+        ? (Number(c.mem || 0) / EXA.mem) * 100
+        : metric === 'iops'
+          ? (cohortIops / EXA.iops) * 100
+          : (cohortStorageTb / XS.storage_tb) * 100;
+
+  const utilExa =
+    metric === 'vcpu'
+      ? (cohortCpuEcpu / EXA.ecpu) * 100
+      : metric === 'memory'
+        ? (Number(c.mem || 0) / EXA.mem) * 100
+        : metric === 'iops'
+          ? (cohortIops / EXA.iops) * 100
+          : (cohortStorageTb / EXA.storage_tb) * 100;
+
+  const perInstScale = 1 / maxInstCount; // keeps Base visually comparable by cohort scope
+  return [
+    { name: 'Base Provisioned', value: utilBase * perInstScale, color: '#b45309' },
+    { name: 'Exascale Provisioned', value: utilXs, color: '#0f766e' },
+    { name: 'Exadata Provisioned', value: utilExa, color: '#1d4ed8' },
+  ];
+}
+
+function renderVerticalSizerChart(chartNode, stats, selectedPct, titleText, colorMain, provisionLines = []) {
   const w = 340;
   const h = 420;
   const left = 44;
@@ -3243,18 +3955,19 @@ function renderVerticalSizerChart(chartNode, stats, selectedPct, titleText, colo
   const plotH = h - top - bottom;
   const xMid = left + plotW * 0.46;
   const boxHalf = Math.max(16, plotW * 0.24);
-  const y = (pct) => top + ((100 - clampPct(pct)) / 100) * plotH;
   const labelX = xMid + boxHalf + 22;
 
   const p = {
-    min: clampPct(stats.min),
-    p30: clampPct(stats.p30),
-    p50: clampPct(stats.p50),
-    p70: clampPct(stats.p70),
-    p95: clampPct(stats.p95),
-    p99: clampPct(stats.p99),
-    max: clampPct(stats.max),
+    min: nonNegativePct(stats.min),
+    p30: nonNegativePct(stats.p30),
+    p50: nonNegativePct(stats.p50),
+    p70: nonNegativePct(stats.p70),
+    p95: nonNegativePct(stats.p95),
+    p99: nonNegativePct(stats.p99),
+    max: nonNegativePct(stats.max),
   };
+  const axisMax = sizerAxisMax([p.max, p.p99, p.p95, selectedPct, ...(provisionLines || []).map((ln) => ln?.value)], 100);
+  const y = (pct) => top + ((axisMax - Math.min(nonNegativePct(pct), axisMax)) / axisMax) * plotH;
 
   const yMin = y(p.min);
   const yQ1 = y(p.p30);
@@ -3263,7 +3976,7 @@ function renderVerticalSizerChart(chartNode, stats, selectedPct, titleText, colo
   const yMax = y(p.max);
   const yP95 = y(p.p95);
   const yP99 = y(p.p99);
-  const ySelected = y(clampPct(selectedPct));
+  const ySelected = y(selectedPct);
   const hasUpperOutlier = p.max > p.p99 + 0.0001;
   const yUpperWhisker = hasUpperOutlier ? yP99 : yMax;
   const outlierDiamond =
@@ -3272,7 +3985,8 @@ function renderVerticalSizerChart(chartNode, stats, selectedPct, titleText, colo
       : '';
 
   const ticks = [];
-  for (let v = 0; v <= 100; v += 10) {
+  const tickStep = axisMax <= 100 ? 10 : axisMax <= 200 ? 20 : 50;
+  for (let v = 0; v <= axisMax; v += tickStep) {
     const yy = y(v);
     ticks.push(
       `<line x1="${left - 5}" y1="${yy}" x2="${left + plotW}" y2="${yy}" stroke="${v % 20 === 0 ? '#e2e8f0' : '#edf2f7'}" />` +
@@ -3285,16 +3999,29 @@ function renderVerticalSizerChart(chartNode, stats, selectedPct, titleText, colo
     `<circle cx="${labelX - 8}" cy="${yy}" r="2.1" fill="${color}" />` +
     `<text x="${labelX}" y="${yy + 3}" font-size="9" fill="#334155">${name} ${fmt(val, 'dec1')}%</text>`;
 
+  const provisionSvg = (provisionLines || [])
+    .map((ln, i) => {
+      const yy = y(ln.value);
+      const lx = left + 6 + (i % 2) * 4;
+      return (
+        `<line x1="${left}" y1="${yy}" x2="${left + plotW}" y2="${yy}" stroke="${ln.color || '#334155'}" stroke-width="1.4" stroke-dasharray="3 3"></line>` +
+        `<text x="${lx}" y="${Math.max(10, yy - 2)}" font-size="8.5" fill="${ln.color || '#334155'}">${esc(shortLabel(`${ln.name} ${fmt(ln.value, 'dec1')}%`, 28))}</text>`
+      );
+    })
+    .join('');
+
   chartNode.innerHTML = `
     <svg viewBox="0 0 ${w} ${h}" role="img" aria-label="${escAttr(titleText)}">
       ${ticks.join('')}
       <text x="${left + plotW / 2}" y="${h - 6}" text-anchor="middle" font-size="10" fill="#64748b">${esc(titleText)}</text>
+      <text x="${left + plotW - 2}" y="${top + 10}" text-anchor="end" font-size="9" fill="#64748b">Max ${fmt(axisMax, 'dec1')}%</text>
       <line x1="${xMid}" y1="${yUpperWhisker}" x2="${xMid}" y2="${yMin}" stroke="#64748b" stroke-width="1.5"></line>
       <rect x="${xMid - boxHalf}" y="${Math.min(yQ3, yQ1)}" width="${boxHalf * 2}" height="${Math.max(2, Math.abs(yQ1 - yQ3))}" fill="${colorMain}22" stroke="${colorMain}" stroke-width="1.2"></rect>
       <line x1="${xMid - boxHalf}" y1="${yMed}" x2="${xMid + boxHalf}" y2="${yMed}" stroke="${colorMain}" stroke-width="2"></line>
       <line x1="${xMid - 10}" y1="${yMin}" x2="${xMid + 10}" y2="${yMin}" stroke="#64748b" stroke-width="1.2"></line>
       <line x1="${xMid - 10}" y1="${yUpperWhisker}" x2="${xMid + 10}" y2="${yUpperWhisker}" stroke="#64748b" stroke-width="1.2"></line>
       ${outlierDiamond}
+      ${provisionSvg}
       <line class="sizer-target-line" x1="${left}" y1="${ySelected}" x2="${left + plotW}" y2="${ySelected}" stroke="#b11f1f" stroke-width="2" stroke-dasharray="5 3"></line>
       <text class="sizer-target-label" x="${left + plotW + 6}" y="${Math.max(12, ySelected - 4)}" font-size="9" fill="#b11f1f">${fmt(clampTargetPct(
         selectedPct,
@@ -3308,7 +4035,122 @@ function renderVerticalSizerChart(chartNode, stats, selectedPct, titleText, colo
     </svg>
   `;
 
-  return { y, p, targetLine: chartNode.querySelector('.sizer-target-line'), targetLabel: chartNode.querySelector('.sizer-target-label') };
+  return { y, p, axisMax, targetLine: chartNode.querySelector('.sizer-target-line'), targetLabel: chartNode.querySelector('.sizer-target-label') };
+}
+
+function renderMultiVerticalSizerChart(chartNode, rows, globalTargetPct, titleText, cohortTargetMap = {}, colorMain = '#0f766e') {
+  if (!chartNode) return null;
+  if (!rows.length) {
+    chartNode.innerHTML = '<p class="muted">No cohort utilization data in current scope.</p>';
+    return null;
+  }
+
+  const count = rows.length;
+  const w = Math.max(360, 88 + count * 64);
+  const h = 420;
+  const left = 40;
+  const right = 24;
+  const top = 18;
+  const bottom = 54;
+  const plotW = w - left - right;
+  const plotH = h - top - bottom;
+  const step = plotW / Math.max(count, 1);
+  const boxHalf = Math.max(10, Math.min(18, step * 0.22));
+  const axisMax = sizerAxisMax(
+    [
+      ...rows.flatMap((row) => [row.min, row.p30, row.p50, row.p70, row.p95, row.p99, row.max]),
+      globalTargetPct,
+      ...rows.map((row) => cohortTargetMap?.[row.cohort]),
+    ],
+    100,
+  );
+  const y = (pct) => top + ((axisMax - Math.min(nonNegativePct(pct), axisMax)) / axisMax) * plotH;
+  const globalY = y(globalTargetPct);
+
+  const ticks = [];
+  const tickStep = axisMax <= 100 ? 10 : axisMax <= 200 ? 20 : 50;
+  for (let v = 0; v <= axisMax; v += tickStep) {
+    const yy = y(v);
+    ticks.push(
+      `<line x1="${left - 4}" y1="${yy}" x2="${w - right}" y2="${yy}" stroke="${v % 20 === 0 ? '#e2e8f0' : '#edf2f7'}" />` +
+        `<text x="${left - 8}" y="${yy + 3}" text-anchor="end" font-size="9" fill="#64748b">${v}%</text>`,
+    );
+  }
+
+  const cohortTargetLines = [];
+  const cohortLabelEls = [];
+  const boxEls = [];
+  rows.forEach((row, idx) => {
+    const xMid = left + step * idx + step / 2;
+    const p = {
+      min: nonNegativePct(row.min),
+      p30: nonNegativePct(row.p30),
+      p50: nonNegativePct(row.p50),
+      p70: nonNegativePct(row.p70),
+      p95: nonNegativePct(row.p95),
+      p99: nonNegativePct(row.p99),
+      max: nonNegativePct(row.max),
+    };
+    const yMin = y(p.min);
+    const yQ1 = y(p.p30);
+    const yMed = y(p.p50);
+    const yQ3 = y(p.p70);
+    const yP99 = y(p.p99);
+    const yMax = y(p.max);
+    const hasUpperOutlier = p.max > p.p99 + 0.0001;
+    const yUpperWhisker = hasUpperOutlier ? yP99 : yMax;
+    const itemColor = colorForItem(row.cohort);
+    const cohortTarget = parseTargetPctOrDefault(cohortTargetMap?.[row.cohort], globalTargetPct);
+    const yCohortTarget = y(cohortTarget);
+
+    boxEls.push(`
+      <line x1="${xMid}" y1="${yUpperWhisker}" x2="${xMid}" y2="${yMin}" stroke="#64748b" stroke-width="1.2"></line>
+      <line x1="${xMid - 8}" y1="${yMin}" x2="${xMid + 8}" y2="${yMin}" stroke="#64748b" stroke-width="1.1"></line>
+      <line x1="${xMid - 8}" y1="${yUpperWhisker}" x2="${xMid + 8}" y2="${yUpperWhisker}" stroke="#64748b" stroke-width="1.1"></line>
+      <rect x="${xMid - boxHalf}" y="${Math.min(yQ3, yQ1)}" width="${boxHalf * 2}" height="${Math.max(2, Math.abs(yQ1 - yQ3))}" fill="${itemColor}22" stroke="${itemColor}" stroke-width="1.2"></rect>
+      <line x1="${xMid - boxHalf}" y1="${yMed}" x2="${xMid + boxHalf}" y2="${yMed}" stroke="${itemColor}" stroke-width="2"></line>
+      ${
+        hasUpperOutlier
+          ? `<polygon points="${xMid},${yMax - 5} ${xMid + 5},${yMax} ${xMid},${yMax + 5} ${xMid - 5},${yMax}" fill="#7c3aed" stroke="#ffffff" stroke-width="0.8"></polygon>`
+          : ''
+      }
+    `);
+    cohortTargetLines.push(
+      `<line class="cohort-target-line" data-cohort-key="${escAttr(row.cohort)}" x1="${xMid - boxHalf - 2}" y1="${yCohortTarget}" x2="${xMid + boxHalf + 2}" y2="${yCohortTarget}" stroke="${itemColor}" stroke-width="2" stroke-dasharray="3 2"></line>`,
+    );
+    cohortLabelEls.push(
+      `<text x="${xMid}" y="${h - 22}" text-anchor="middle" font-size="9" fill="#475569">${esc(shortLabel(row.cohort, 12))}</text>`,
+    );
+  });
+
+  chartNode.innerHTML = `
+    <svg viewBox="0 0 ${w} ${h}" role="img" aria-label="${escAttr(titleText)}">
+      ${ticks.join('')}
+      <line class="sizer-target-line" x1="${left}" y1="${globalY}" x2="${w - right}" y2="${globalY}" stroke="#b11f1f" stroke-width="2" stroke-dasharray="5 3"></line>
+      <text class="sizer-target-label" x="${w - right - 2}" y="${Math.max(12, globalY - 4)}" text-anchor="end" font-size="9" fill="#b11f1f">${fmt(
+        clampTargetPct(globalTargetPct),
+        'dec1',
+      )}%</text>
+      ${boxEls.join('')}
+      ${cohortTargetLines.join('')}
+      ${cohortLabelEls.join('')}
+      <text x="${left + plotW / 2}" y="${h - 6}" text-anchor="middle" font-size="10" fill="#64748b">${esc(titleText)}</text>
+      <text x="${w - right - 2}" y="${top + 10}" text-anchor="end" font-size="9" fill="#64748b">Max ${fmt(axisMax, 'dec1')}%</text>
+      <text x="${left + 2}" y="${top + 10}" font-size="9" fill="${colorMain}">One boxplot per cohort</text>
+    </svg>
+  `;
+
+  const cohortTargets = new Map();
+  chartNode.querySelectorAll('.cohort-target-line').forEach((el) => {
+    cohortTargets.set(decodeKey(el.getAttribute('data-cohort-key')), el);
+  });
+  return {
+    y,
+    axisMax,
+    targetLine: chartNode.querySelector('.sizer-target-line'),
+    targetLabel: chartNode.querySelector('.sizer-target-label'),
+    cohortTargets,
+  };
 }
 
 function renderGlobalVcpuSizer(kind) {
@@ -3319,11 +4161,22 @@ function renderGlobalVcpuSizer(kind) {
   const controlsNode = $('globalSizerControls');
   if (!chartNode || !memChartNode || !iopsChartNode || !storageChartNode || !controlsNode) return;
 
+  ensureCohortTargetsInitialized(kind);
   const stats = computeGlobalInstanceCpuStats(kind);
   const memStats = computeGlobalInstanceMemoryStats(kind);
   const iopsStats = computeGlobalIopsStats(kind);
   const storageStats = computeGlobalStorageStats(kind);
+  const vcpuRows = computeGlobalCohortMetricRows(kind, 'vcpu');
+  const memRows = computeGlobalCohortMetricRows(kind, 'memory');
+  const iopsRows = computeGlobalCohortMetricRows(kind, 'iops');
+  const storageRows = computeGlobalCohortMetricRows(kind, 'storage');
   const globalTotals = computeGlobal(kind);
+  const cohortTargetsByMetric = {
+    vcpu: Object.fromEntries(computeByCohort(kind).map((row) => [row.cohort, parseTargetPctOrDefault(ensureCohortTargetContainer(row.cohort).vcpu, getGlobalTarget('vcpu'))])),
+    memory: Object.fromEntries(computeByCohort(kind).map((row) => [row.cohort, parseTargetPctOrDefault(ensureCohortTargetContainer(row.cohort).memory, getGlobalTarget('memory'))])),
+    iops: Object.fromEntries(computeByCohort(kind).map((row) => [row.cohort, parseTargetPctOrDefault(ensureCohortTargetContainer(row.cohort).iops, getGlobalTarget('iops'))])),
+    storage: Object.fromEntries(computeByCohort(kind).map((row) => [row.cohort, parseTargetPctOrDefault(ensureCohortTargetContainer(row.cohort).storage, getGlobalTarget('storage'))])),
+  };
   const metricCfg = {
     vcpu: { total: Number(globalTotals?.vcpu_total) || 0, unit: 'vCPU', fmt: 'dec1' },
     memory: { total: Number(globalTotals?.memory_gb_total) || 0, unit: 'GB', fmt: 'dec1' },
@@ -3339,32 +4192,32 @@ function renderGlobalVcpuSizer(kind) {
     return;
   }
 
-  if (stats && !Number.isFinite(Number(state.vcpuSizingTargetPct))) {
-    state.vcpuSizingTargetPct = clampTargetPct(stats.p95 * 1.2);
+  if (stats && !Number.isFinite(state.vcpuSizingTargetPct)) {
+    state.vcpuSizingTargetPct = 100;
   }
-  if (memStats && !Number.isFinite(Number(state.memorySizingTargetPct))) {
-    state.memorySizingTargetPct = clampTargetPct(memStats.p95 * 1.2);
+  if (memStats && !Number.isFinite(state.memorySizingTargetPct)) {
+    state.memorySizingTargetPct = 100;
   }
-  if (iopsStats && !Number.isFinite(Number(state.iopsSizingTargetPct))) {
-    state.iopsSizingTargetPct = clampTargetPct(iopsStats.p95 * 1.2);
+  if (iopsStats && !Number.isFinite(state.iopsSizingTargetPct)) {
+    state.iopsSizingTargetPct = 100;
   }
-  if (storageStats && !Number.isFinite(Number(state.storageSizingTargetPct))) {
-    state.storageSizingTargetPct = clampTargetPct(storageStats.p95 * 1.2);
+  if (storageStats && !Number.isFinite(state.storageSizingTargetPct)) {
+    state.storageSizingTargetPct = 100;
   }
 
-  const vcpuModel = stats
-    ? renderVerticalSizerChart(chartNode, stats, state.vcpuSizingTargetPct, 'VCPU Utilization', '#0f766e')
+  const vcpuModel = vcpuRows.length
+    ? renderMultiVerticalSizerChart(chartNode, vcpuRows, state.vcpuSizingTargetPct, 'VCPU Utilization', cohortTargetsByMetric.vcpu, '#0f766e')
     : null;
-  const memModel = memStats
-    ? renderVerticalSizerChart(memChartNode, memStats, state.memorySizingTargetPct, 'Memory Utilization', '#0e7490')
+  const memModel = memRows.length
+    ? renderMultiVerticalSizerChart(memChartNode, memRows, state.memorySizingTargetPct, 'Memory Utilization', cohortTargetsByMetric.memory, '#0e7490')
     : null;
   if (!iopsStats) iopsChartNode.innerHTML = '<p class="muted">No IOPS utilization data in current scope.</p>';
-  const iopsModel = iopsStats
-    ? renderVerticalSizerChart(iopsChartNode, iopsStats, state.iopsSizingTargetPct, 'IOPS Utilization', '#6d28d9')
+  const iopsModel = iopsRows.length
+    ? renderMultiVerticalSizerChart(iopsChartNode, iopsRows, state.iopsSizingTargetPct, 'IOPS Utilization', cohortTargetsByMetric.iops, '#6d28d9')
     : null;
   if (!storageStats) storageChartNode.innerHTML = '<p class="muted">No storage utilization data in current scope.</p>';
-  const storageModel = storageStats
-    ? renderVerticalSizerChart(storageChartNode, storageStats, state.storageSizingTargetPct, 'Storage Utilization', '#b45309')
+  const storageModel = storageRows.length
+    ? renderMultiVerticalSizerChart(storageChartNode, storageRows, state.storageSizingTargetPct, 'Storage Utilization', cohortTargetsByMetric.storage, '#b45309')
     : null;
 
   controlsNode.innerHTML = `
@@ -3443,9 +4296,9 @@ function renderGlobalVcpuSizer(kind) {
     const quantNode = quantByType[which];
     const cfg = metricCfg[which];
     if (!model || !baseline) return;
-    const p95v = clampPct(baseline.p95);
+    const p95v = nonNegativePct(baseline.p95);
     const relPct = p95v > 0 ? ((selected - p95v) / p95v) * 100 : 0;
-    const yy = model.y(clampPct(selected));
+    const yy = model.y(selected);
     if (model.targetLine) {
       model.targetLine.setAttribute('y1', String(yy));
       model.targetLine.setAttribute('y2', String(yy));
@@ -3454,8 +4307,22 @@ function renderGlobalVcpuSizer(kind) {
       model.targetLabel.setAttribute('y', String(Math.max(12, yy - 4)));
       model.targetLabel.textContent = `${fmt(selected, 'dec1')}%${selected > 100 ? ' (off-scale)' : ''}`;
     }
+    if (model.cohortTargets instanceof Map) {
+      model.cohortTargets.forEach((el, cohort) => {
+        const cohortSelected = parseTargetPctOrDefault(ensureCohortTargetContainer(cohort)[which], selected);
+        const cohortY = model.y(cohortSelected);
+        el.setAttribute('y1', String(cohortY));
+        el.setAttribute('y2', String(cohortY));
+      });
+    }
     if (summaryNode) {
-      summaryNode.textContent = `P95 ${fmt(p95v, 'dec1')}% | Target ${fmt(selected, 'dec1')}% | Δ ${fmt(selected - p95v, 'dec1')} pts (${fmt(relPct, 'dec1')}%)`;
+      const cohortVals = computeByCohort(kind).map((row) => parseTargetPctOrDefault(ensureCohortTargetContainer(row.cohort)[which], selected));
+      const cohortMin = cohortVals.length ? Math.min(...cohortVals) : selected;
+      const cohortMax = cohortVals.length ? Math.max(...cohortVals) : selected;
+      summaryNode.textContent = `P95 ${fmt(p95v, 'dec1')}% | Global target ${fmt(selected, 'dec1')}% | Cohort targets ${fmt(cohortMin, 'dec1')}%-${fmt(cohortMax, 'dec1')}% | Δ ${fmt(
+        selected - p95v,
+        'dec1',
+      )} pts (${fmt(relPct, 'dec1')}%)`;
     }
     if (quantNode && cfg) {
       const maxQty = cfg.total;
@@ -3472,7 +4339,8 @@ function renderGlobalVcpuSizer(kind) {
         return;
       }
       if (vcpuErrNode) vcpuErrNode.textContent = '';
-      state.vcpuSizingTargetPct = v.value;
+      setGlobalTarget('vcpu', v.value);
+      cascadeGlobalTargetsToCohorts(kind, 'vcpu');
       updateOneUi('vcpu');
     });
     vcpuInput.addEventListener('blur', () => {
@@ -3482,8 +4350,9 @@ function renderGlobalVcpuSizer(kind) {
         if (vcpuErrNode) vcpuErrNode.textContent = '';
         return;
       }
-      state.vcpuSizingTargetPct = clampTargetPct(v.value);
-      vcpuInput.value = String(fmt(clampTargetPct(state.vcpuSizingTargetPct), 'dec1'));
+      setGlobalTarget('vcpu', v.value);
+      cascadeGlobalTargetsToCohorts(kind, 'vcpu');
+      vcpuInput.value = String(fmt(getGlobalTarget('vcpu'), 'dec1'));
       if (vcpuErrNode) vcpuErrNode.textContent = '';
       updateOneUi('vcpu');
     });
@@ -3497,7 +4366,8 @@ function renderGlobalVcpuSizer(kind) {
         return;
       }
       if (memErrNode) memErrNode.textContent = '';
-      state.memorySizingTargetPct = v.value;
+      setGlobalTarget('memory', v.value);
+      cascadeGlobalTargetsToCohorts(kind, 'memory');
       updateOneUi('memory');
     });
     memInput.addEventListener('blur', () => {
@@ -3507,8 +4377,9 @@ function renderGlobalVcpuSizer(kind) {
         if (memErrNode) memErrNode.textContent = '';
         return;
       }
-      state.memorySizingTargetPct = clampTargetPct(v.value);
-      memInput.value = String(fmt(clampTargetPct(state.memorySizingTargetPct), 'dec1'));
+      setGlobalTarget('memory', v.value);
+      cascadeGlobalTargetsToCohorts(kind, 'memory');
+      memInput.value = String(fmt(getGlobalTarget('memory'), 'dec1'));
       if (memErrNode) memErrNode.textContent = '';
       updateOneUi('memory');
     });
@@ -3522,7 +4393,8 @@ function renderGlobalVcpuSizer(kind) {
         return;
       }
       if (iopsErrNode) iopsErrNode.textContent = '';
-      state.iopsSizingTargetPct = v.value;
+      setGlobalTarget('iops', v.value);
+      cascadeGlobalTargetsToCohorts(kind, 'iops');
       updateOneUi('iops');
     });
     iopsInput.addEventListener('blur', () => {
@@ -3532,8 +4404,9 @@ function renderGlobalVcpuSizer(kind) {
         if (iopsErrNode) iopsErrNode.textContent = '';
         return;
       }
-      state.iopsSizingTargetPct = clampTargetPct(v.value);
-      iopsInput.value = String(fmt(clampTargetPct(state.iopsSizingTargetPct), 'dec1'));
+      setGlobalTarget('iops', v.value);
+      cascadeGlobalTargetsToCohorts(kind, 'iops');
+      iopsInput.value = String(fmt(getGlobalTarget('iops'), 'dec1'));
       if (iopsErrNode) iopsErrNode.textContent = '';
       updateOneUi('iops');
     });
@@ -3547,7 +4420,8 @@ function renderGlobalVcpuSizer(kind) {
         return;
       }
       if (storageErrNode) storageErrNode.textContent = '';
-      state.storageSizingTargetPct = v.value;
+      setGlobalTarget('storage', v.value);
+      cascadeGlobalTargetsToCohorts(kind, 'storage');
       updateOneUi('storage');
     });
     storageInput.addEventListener('blur', () => {
@@ -3557,8 +4431,9 @@ function renderGlobalVcpuSizer(kind) {
         if (storageErrNode) storageErrNode.textContent = '';
         return;
       }
-      state.storageSizingTargetPct = clampTargetPct(v.value);
-      storageInput.value = String(fmt(clampTargetPct(state.storageSizingTargetPct), 'dec1'));
+      setGlobalTarget('storage', v.value);
+      cascadeGlobalTargetsToCohorts(kind, 'storage');
+      storageInput.value = String(fmt(getGlobalTarget('storage'), 'dec1'));
       if (storageErrNode) storageErrNode.textContent = '';
       updateOneUi('storage');
     });
@@ -4080,6 +4955,14 @@ async function renderPptPreviewPageAsync(token) {
 function renderCohortPage(kind) {
   const rows = selectedInstances(kind).filter((r) => r.cohort === state.page.cohort);
   const summary = computeSummaryFromRows(rows);
+  ensureCohortTargetsInitialized(kind);
+  const cohortCfg = ensureCohortTargetContainer(state.page.cohort);
+  const cohortTargets = {
+    vcpu: parseTargetPctOrDefault(cohortCfg.vcpu, getGlobalTarget('vcpu')),
+    memory: parseTargetPctOrDefault(cohortCfg.memory, getGlobalTarget('memory')),
+    iops: parseTargetPctOrDefault(cohortCfg.iops, getGlobalTarget('iops')),
+    storage: parseTargetPctOrDefault(cohortCfg.storage, getGlobalTarget('storage')),
+  };
 
   $('cohortPageTitle').textContent = `Cohort: ${state.page.cohort}`;
   $('cohortPageBody').innerHTML = `
@@ -4090,6 +4973,46 @@ function renderCohortPage(kind) {
       <div class="kpi"><div class="name">vCPU</div><div class="value">${fmt(summary.vcpu_total, 'dec1')}</div></div>
       <div class="kpi"><div class="name">Memory (GB)</div><div class="value">${fmt(summary.memory_gb_total, 'dec1')}</div></div>
       <div class="kpi"><div class="name">Allocated (GB)</div><div class="value">${fmt(summary.allocated_storage_gb, 'dec1')}</div></div>
+    </div>
+    <div class="chart-box" style="margin-top:10px;">
+      <h3>Cohort Sizing Overrides</h3>
+      <p class="muted">Adjust this cohort targets. Global target is recalculated as weighted average.</p>
+      <div class="global-sizer-controls-grid">
+        <div class="global-sizer-control-card">
+          <label for="cohortTargetVcpuInput" style="margin:0 0 4px;color:#475569;font-size:12px;">VCPU target (0-200%)</label>
+          <input id="cohortTargetVcpuInput" type="number" min="0" max="200" step="0.1" value="${fmt(cohortTargets.vcpu, 'dec1')}" style="width:100%;padding:6px 8px;border:1px solid #cfd6df;border-radius:8px;" />
+          <div id="cohortTargetVcpuError" style="min-height:16px;color:#b91c1c;font-size:11px;margin-top:4px;"></div>
+          <div id="cohortTargetVcpuSummary" class="line" style="font-size:11px;color:#475569;"></div>
+        </div>
+        <div class="global-sizer-control-card">
+          <label for="cohortTargetMemInput" style="margin:0 0 4px;color:#475569;font-size:12px;">Memory target (0-200%)</label>
+          <input id="cohortTargetMemInput" type="number" min="0" max="200" step="0.1" value="${fmt(cohortTargets.memory, 'dec1')}" style="width:100%;padding:6px 8px;border:1px solid #cfd6df;border-radius:8px;" />
+          <div id="cohortTargetMemError" style="min-height:16px;color:#b91c1c;font-size:11px;margin-top:4px;"></div>
+          <div id="cohortTargetMemSummary" class="line" style="font-size:11px;color:#475569;"></div>
+        </div>
+        <div class="global-sizer-control-card">
+          <label for="cohortTargetIopsInput" style="margin:0 0 4px;color:#475569;font-size:12px;">IOPS target (0-200%)</label>
+          <input id="cohortTargetIopsInput" type="number" min="0" max="200" step="0.1" value="${fmt(cohortTargets.iops, 'dec1')}" style="width:100%;padding:6px 8px;border:1px solid #cfd6df;border-radius:8px;" />
+          <div id="cohortTargetIopsError" style="min-height:16px;color:#b91c1c;font-size:11px;margin-top:4px;"></div>
+          <div id="cohortTargetIopsSummary" class="line" style="font-size:11px;color:#475569;"></div>
+        </div>
+        <div class="global-sizer-control-card">
+          <label for="cohortTargetStorageInput" style="margin:0 0 4px;color:#475569;font-size:12px;">Storage target (0-200%)</label>
+          <input id="cohortTargetStorageInput" type="number" min="0" max="200" step="0.1" value="${fmt(cohortTargets.storage, 'dec1')}" style="width:100%;padding:6px 8px;border:1px solid #cfd6df;border-radius:8px;" />
+          <div id="cohortTargetStorageError" style="min-height:16px;color:#b91c1c;font-size:11px;margin-top:4px;"></div>
+          <div id="cohortTargetStorageSummary" class="line" style="font-size:11px;color:#475569;"></div>
+        </div>
+      </div>
+    </div>
+    <div class="chart-box" style="margin-top:10px;">
+      <h3>Cohort Effective Sizing by Deployment</h3>
+      <p class="muted">Provisioned lines shown for Base, Exascale, and Exadata per metric.</p>
+      <div class="global-vcpu-sizer-wrap">
+        <div id="cohortSizerChartVcpu" class="global-vcpu-sizer-chart"></div>
+        <div id="cohortSizerChartMem" class="global-vcpu-sizer-chart"></div>
+        <div id="cohortSizerChartIops" class="global-vcpu-sizer-chart"></div>
+        <div id="cohortSizerChartStorage" class="global-vcpu-sizer-chart"></div>
+      </div>
     </div>
     <p class="muted" style="margin-top:10px;">Select an instance to continue.</p>
     <div class="chart-box" style="margin-bottom:10px;">
@@ -4150,6 +5073,103 @@ function renderCohortPage(kind) {
       goToInstance(state.page.cohort, decodeKey(tr.dataset.pageInstanceKey));
     });
   });
+
+  const validateTargetInput = (raw) => {
+    if (raw == null || String(raw).trim() === '') return { ok: false, msg: 'Enter a value between 0 and 200.' };
+    const n = Number(raw);
+    if (!Number.isFinite(n)) return { ok: false, msg: 'Invalid number.' };
+    if (n < 0) return { ok: false, msg: 'Minimum is 0.' };
+    if (n > 200) return { ok: false, msg: 'Max is 200.' };
+    return { ok: true, value: n };
+  };
+
+  const hookCohortTarget = (metric, inputId, errId, summaryId) => {
+    const input = $('cohortPageBody').querySelector(`#${inputId}`);
+    const errNode = $('cohortPageBody').querySelector(`#${errId}`);
+    const summaryNode = $('cohortPageBody').querySelector(`#${summaryId}`);
+    if (!input) return;
+    const refreshSummary = () => {
+      const cohortVal = parseTargetPctOrDefault(ensureCohortTargetContainer(state.page.cohort)[metric], 100);
+      const globalVal = getGlobalTarget(metric);
+      if (summaryNode) summaryNode.textContent = `Cohort: ${fmt(cohortVal, 'dec1')}% | Weighted global: ${fmt(globalVal, 'dec1')}%`;
+    };
+    input.addEventListener('input', () => {
+      const v = validateTargetInput(input.value);
+      if (!v.ok) {
+        if (errNode) errNode.textContent = v.msg;
+        return;
+      }
+      if (errNode) errNode.textContent = '';
+      ensureCohortTargetContainer(state.page.cohort)[metric] = v.value;
+      recomputeGlobalTargetFromCohorts(kind, metric);
+      refreshSummary();
+    });
+    input.addEventListener('blur', () => {
+      const v = validateTargetInput(input.value);
+      if (!v.ok) {
+        input.value = String(fmt(parseTargetPctOrDefault(ensureCohortTargetContainer(state.page.cohort)[metric], 100), 'dec1'));
+        if (errNode) errNode.textContent = '';
+        return;
+      }
+      ensureCohortTargetContainer(state.page.cohort)[metric] = clampTargetPct(v.value);
+      recomputeGlobalTargetFromCohorts(kind, metric);
+      input.value = String(fmt(parseTargetPctOrDefault(ensureCohortTargetContainer(state.page.cohort)[metric], 100), 'dec1'));
+      if (errNode) errNode.textContent = '';
+      refreshSummary();
+    });
+    refreshSummary();
+  };
+
+  hookCohortTarget('vcpu', 'cohortTargetVcpuInput', 'cohortTargetVcpuError', 'cohortTargetVcpuSummary');
+  hookCohortTarget('memory', 'cohortTargetMemInput', 'cohortTargetMemError', 'cohortTargetMemSummary');
+  hookCohortTarget('iops', 'cohortTargetIopsInput', 'cohortTargetIopsError', 'cohortTargetIopsSummary');
+  hookCohortTarget('storage', 'cohortTargetStorageInput', 'cohortTargetStorageError', 'cohortTargetStorageSummary');
+
+  const vcpuStats = computeCohortCpuStats(kind, state.page.cohort);
+  const memStats = computeCohortMemoryStats(kind, state.page.cohort);
+  const iopsStats = computeCohortIopsStats(kind, state.page.cohort);
+  const storageStats = computeCohortStorageStats(kind, state.page.cohort);
+
+  if (vcpuStats) {
+    renderVerticalSizerChart(
+      $('cohortPageBody').querySelector('#cohortSizerChartVcpu'),
+      vcpuStats,
+      cohortTargets.vcpu,
+      'VCPU Utilization',
+      '#0f766e',
+      cohortProvisionLines(kind, state.page.cohort, 'vcpu'),
+    );
+  }
+  if (memStats) {
+    renderVerticalSizerChart(
+      $('cohortPageBody').querySelector('#cohortSizerChartMem'),
+      memStats,
+      cohortTargets.memory,
+      'Memory Utilization',
+      '#0e7490',
+      cohortProvisionLines(kind, state.page.cohort, 'memory'),
+    );
+  }
+  if (iopsStats) {
+    renderVerticalSizerChart(
+      $('cohortPageBody').querySelector('#cohortSizerChartIops'),
+      iopsStats,
+      cohortTargets.iops,
+      'IOPS Utilization',
+      '#6d28d9',
+      cohortProvisionLines(kind, state.page.cohort, 'iops'),
+    );
+  }
+  if (storageStats) {
+    renderVerticalSizerChart(
+      $('cohortPageBody').querySelector('#cohortSizerChartStorage'),
+      storageStats,
+      cohortTargets.storage,
+      'Storage Utilization',
+      '#b45309',
+      cohortProvisionLines(kind, state.page.cohort, 'storage'),
+    );
+  }
 
   const instanceSeries = buildInstanceCpuTimeSeries(kind, state.page.cohort);
   const cpuMax = cpuFixedMax();
@@ -5030,16 +6050,37 @@ function initEvents() {
       return;
     }
     const payload = reportStateSnapshot();
-    const stamp = new Date().toISOString().replaceAll(':', '-').slice(0, 19);
-    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = `awr_review_report_${stamp}.json`;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(a.href);
-    setStatus(`Report saved (${a.download}).`);
+    const fileName = downloadJsonFile(payload, 'awr_review_report');
+    setStatus(`Report saved (${fileName}).`);
+  });
+
+  const advisorProfileSelect = $('advisorExportProfile');
+  if (advisorProfileSelect) {
+    advisorProfileSelect.value = state.advisorExportProfile === 'comprehensive' ? 'comprehensive' : 'compact';
+    advisorProfileSelect.addEventListener('change', (e) => {
+      state.advisorExportProfile = e.target.value === 'comprehensive' ? 'comprehensive' : 'compact';
+    });
+  }
+
+  $('exportAdvisorJsonBtn')?.addEventListener('click', () => {
+    if (!state.raw || !state.graph) {
+      setStatus('No data loaded. Load JSON first.');
+      return;
+    }
+    const profile = state.advisorExportProfile === 'comprehensive' ? 'comprehensive' : 'compact';
+    const payloads = buildAdvisorExportPayloads('web', 1, profile);
+    if (!payloads.length) {
+      setStatus('Could not build Advisor export payload.');
+      return;
+    }
+    const files = payloads.map((payload, idx) => {
+      const cohortLabel = (payload?.scope?.selected_cohorts || [])[0] || `part${String(idx + 1).padStart(2, '0')}`;
+      const safeCohort = String(cohortLabel).replace(/[^a-zA-Z0-9_-]+/g, '_');
+      return downloadJsonFile(payload, `awr_advisor_context_${safeCohort}`, false);
+    });
+    setStatus(
+      `Advisor JSON exported in ${files.length} file(s), profile ${profile}, split: 1 cohort per file. Upload each part to ChatGPT AWR DBA Advisor.`,
+    );
   });
 
   if (CHATBOT_ENABLED) {
